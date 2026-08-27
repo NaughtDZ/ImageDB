@@ -1,0 +1,26 @@
+# 虚拟环境
+.venv/
+
+# 运行时数据（数据库/缩略图/抽帧/模型）
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 编辑器
+.vscode/
+.idea/
+
+# 日志
+*.log
+
+# 模型文件（用户自行下载，不入库）
+*.onnx
+*.safetensors
+
+# 本地测试/临时文件
+test_media/
+_prov_test.jpg
+*.tmp

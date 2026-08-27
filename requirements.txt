@@ -1,0 +1,17 @@
+# ============================================================
+# ImageDB 依赖清单
+# 安装：pip install -r requirements.txt
+# 注意：onnxruntime 相关运行库为可选依赖（体积较大），按需安装：
+#   - 打标需要 ONNX 模型（cl-tagger / wd14）：
+#       Windows 显卡推荐（DirectML 加速）：pip install onnxruntime-directml
+#       纯 CPU 回退：pip install onnxruntime
+#   - 视频抽帧/缩略图需要 OpenCV：
+#       pip install opencv-python-headless
+# 程序对以上可选库做了容错，缺少时对应功能自动禁用，不影响其余功能。
+# ============================================================
+
+fastapi>=0.110.0
+uvicorn>=0.29.0
+requests>=2.31.0
+pillow>=10.0.0
+numpy>=1.24.0

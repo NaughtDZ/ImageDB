@@ -1,0 +1,189 @@
+/* ============================================================
+ * 应用主模块：全局状态 + 初始化 + 顶栏事件
+ * ============================================================ */
+const App = {
+  // 全局状态
+  state: {
+    tree: [],              // 目录树（后端返回）
+    currentFolderId: null, // 当前选中的目录 id（null = 全部）
+    items: [],             // 当前画廊展示的媒体
+    total: 0,              // 当前筛选条件下的总数
+    page: 1,               // 当前页码
+    pageSize: 60,
+    selected: new Set(),   // 选中的媒体 id 集合
+    lastAnchor: null,      // 上次单击的媒体 id（Shift 区间选择的锚点）
+    filters: { q: "", dir: "", tags: "", type: "" },
+  },
+
+  /** 应用初始化 */
+  async init() {
+    this.bindEvents();
+    // 启动时优先读取数据库构建目录树
+    await TreeView.refresh();
+    // 加载第一页媒体
+    await Gallery.load(true);
+    // 初始化查看器键盘事件
+    Viewer.initKeyboard();
+    // 初始化各对话框组件
+    Tagger.init();
+    TagsEditor.init();
+    Settings.init();
+    // 初始化画廊框选
+    Gallery.initBoxSelect();
+    // 初始化缩略图大小滑块
+    Gallery.initThumbSlider();
+    // 初始化右侧标签侧边栏
+    SidePanel.init();
+  },
+
+  /** 绑定顶栏与全局事件 */
+  bindEvents() {
+    // 搜索
+    document.getElementById("btn-search").onclick = () => this.applyFilters();
+    document.getElementById("btn-reset").onclick = () => {
+      document.getElementById("search-q").value = "";
+      document.getElementById("search-dir").value = "";
+      document.getElementById("search-tags").value = "";
+      document.getElementById("search-type").value = "";
+      this.applyFilters();
+    };
+    // 回车触发搜索
+    ["search-q", "search-dir", "search-tags"].forEach(id => {
+      document.getElementById(id).addEventListener("keydown", (e) => {
+        if (e.key === "Enter") this.applyFilters();
+      });
+    });
+
+    // 顶栏按钮
+    document.getElementById("btn-import").onclick = () => this.importFolder();
+    document.getElementById("btn-rescan").onclick = () => this.rescanCurrent();
+    document.getElementById("btn-verify").onclick = () => this.verifyAll();
+    document.getElementById("btn-settings").onclick = () => Settings.open();
+    document.getElementById("btn-add-folder").onclick = () => this.importFolder();
+
+    // 工具栏
+    document.getElementById("btn-tag").onclick = () => Tagger.open();
+    document.getElementById("btn-view").onclick = () => this.openViewer();
+    document.getElementById("btn-manual-tags").onclick = () => TagsEditor.open();
+    document.getElementById("btn-clear-sel").onclick = () => Gallery.clearSelection();
+    document.getElementById("btn-delete-sel").onclick = () => this.deleteSelected();
+    document.getElementById("btn-loadmore").onclick = () => Gallery.load(false);
+    document.getElementById("sort-select").onchange = () => Gallery.load(true);
+
+    // 点击空白处关闭右键菜单
+    document.addEventListener("click", () => {
+      const m = document.getElementById("context-menu");
+      if (m) m.remove();
+    });
+  },
+
+  /** 从搜索框收集筛选条件并重新加载 */
+  applyFilters() {
+    this.state.filters = {
+      q: document.getElementById("search-q").value.trim(),
+      dir: document.getElementById("search-dir").value.trim(),
+      // 标签搜索：空格/逗号分隔多个标签，AND 语义（后端处理）
+      tags: document.getElementById("search-tags").value.trim(),
+      type: document.getElementById("search-type").value,
+    };
+    Gallery.load(true);
+  },
+
+  /** 导入目录 */
+  async importFolder() {
+    const path = await promptDialog({
+      title: "导入目录",
+      message: "输入要导入的目录绝对路径（将递归扫描其中的图片/视频路径并入库）：",
+      placeholder: "例如 D:\Pictures\收藏",
+      okText: "导入",
+    });
+    if (!path) return;
+    try {
+      const res = await API.post("/api/library/import", { path });
+      toast("导入完成：新增媒体 " + res.media_added + " 个", "ok");
+      await TreeView.refresh();
+      await Gallery.load(true);
+    } catch (e) {
+      toast("导入失败：" + e.message, "err");
+    }
+  },
+
+  /** 重新扫描当前目录 */
+  async rescanCurrent() {
+    if (!this.state.currentFolderId) {
+      toast("请先在左侧选择一个目录", "err");
+      return;
+    }
+    try {
+      const res = await API.post("/api/library/rescan", { folder_id: this.state.currentFolderId });
+      toast("扫描完成：新增 " + res.added + "，清理缺失 " + res.removed_media, "ok");
+      await TreeView.refresh();
+      await Gallery.load(true);
+    } catch (e) {
+      toast("扫描失败：" + e.message, "err");
+    }
+  },
+
+  /** 全库校验缺失 */
+  async verifyAll() {
+    try {
+      const res = await API.post("/api/library/verify", {});
+      toast("校验完成：清理目录 " + res.removed_folders + " 个，媒体 " + res.removed_media + " 个", "ok");
+      await TreeView.refresh();
+      await Gallery.load(true);
+    } catch (e) {
+      toast("校验失败：" + e.message, "err");
+    }
+  },
+
+  /** 从数据库中删除选中项（不删除磁盘文件） */
+  async deleteSelected() {
+    const sel = [...this.state.selected];
+    if (sel.length === 0) {
+      toast("请先选择要删除的素材", "err");
+      return;
+    }
+    const ok = await promptDialog({
+      title: "确认删除",
+      message: "将从数据库中删除 " + sel.length + " 个素材的记录（磁盘文件不会被删除）。输入 yes 确认：",
+      placeholder: "yes",
+    });
+    if (ok !== "yes") return;
+    try {
+      const res = await API.post("/api/media/delete", { media_ids: sel });
+      toast("已删除 " + res.removed + " 个记录", "ok");
+      // 清理选择与画廊
+      this.state.selected.clear();
+      this.state.lastAnchor = null;
+      await Gallery.load(true);
+      await TreeView.refresh();
+      SidePanel.refresh();
+    } catch (e) {
+      toast("删除失败：" + e.message, "err");
+    }
+  },
+
+  /** 打开查看器 */
+  openViewer() {
+    const sel = [...this.state.selected];
+    if (this.state.items.length === 0) {
+      toast("没有可查看的素材", "err");
+      return;
+    }
+    if (sel.length > 1) {
+      // 多选：按选中顺序查看
+      const list = this.state.items.filter(i => sel.includes(i.id));
+      Viewer.open(list, 0);
+    } else if (sel.length === 1) {
+      // 单选：仍传入完整列表，但定位到选中项（便于浏览/幻灯片循环）
+      const idx = this.state.items.findIndex(i => i.id === sel[0]);
+      Viewer.open(this.state.items, idx >= 0 ? idx : 0);
+    } else {
+      // 未选中：查看当前列表
+      Viewer.open(this.state.items, 0);
+    }
+  },
+};
+
+// 页面加载完成后初始化
+window.addEventListener("DOMContentLoaded", () => App.init());
