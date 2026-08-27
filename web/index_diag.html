@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ImageDB 素材管理器</title>
+<!-- 网站图标（favicon）：浏览器标签页/书签上显示的小图标 -->
+<!-- 支持三种格式，浏览器自动选择可用的；只需放一个即可（推荐 SVG 矢量图） -->
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="shortcut icon" href="favicon.ico">
+<link rel="stylesheet" href="css/style.css">
+<body>
+
+<!-- ========== 顶栏 ========== -->
+<header id="topbar">
+  <div class="brand">
+    <span class="logo">🖼</span>
+    <span class="title">ImageDB</span>
+    <span class="subtitle">素材管理器</span>
+  </div>
+
+  <div class="searchbox">
+    <input id="search-q" type="text" placeholder="按文件名搜索…" title="文件名关键字">
+    <input id="search-dir" type="text" placeholder="按目录名搜索…" title="目录路径关键字">
+    <input id="search-tags" type="text" placeholder="按标签过滤（空格/逗号分隔，多标签取交集）" title="多个标签用空格或逗号分隔，默认取交集（AND）">
+    <select id="search-type">
+      <option value="">全部类型</option>
+      <option value="image">图片</option>
+      <option value="video">视频</option>
+    </select>
+    <button id="btn-search" class="btn primary">搜索</button>
+    <button id="btn-reset" class="btn">重置</button>
+  </div>
+
+  <div class="actions">
+    <button id="btn-import" class="btn primary">＋ 导入目录</button>
+    <button id="btn-rescan" class="btn" title="重新扫描当前目录">⟳ 重新扫描</button>
+    <button id="btn-verify" class="btn" title="全库校验：自动清理已删除文件">✔ 校验缺失</button>
+    <button id="btn-settings" class="btn" title="代理 / 打标 / 视频 / 模型下载">⚙ 设置</button>
+  </div>
+</header>
+
+<!-- ========== 主体布局 ========== -->
+<!-- 导入进度条（后台导入时显示） -->
+<div id="import-progress-bar" class="import-progress hidden">
+  <div class="import-progress-inner">
+    <div id="import-progress-fill" class="import-progress-fill"></div>
+  </div>
+  <span id="import-progress-text">正在统计文件……</span>
+</div>
+
+<div id="main">
+  <!-- 左侧：目录树 -->
+  <aside id="sidebar">
+    <div class="side-head">
+      <span>📂 目录库</span>
+      <button id="btn-add-folder" class="mini-btn" title="添加待归集目录">＋</button>
+    </div>
+    <div id="tree" class="tree"></div>
+  </aside>
+
+  <!-- 右侧：画廊 -->
+  <section id="content">
+    <div id="toolbar">
+      <span id="sel-info">未选择</span>
+      <span id="result-info"></span>
+      <div class="toolbar-actions">
+        <span class="thumb-slider" title="调整缩略图大小">
+          <span class="icon">🔍</span>
+          <input type="range" id="thumb-size-slider" min="100" max="400" value="160">
+          <span class="icon" style="font-size:16px">🔎</span>
+        </span>
+        <span class="page-size" title="每页显示数量（翻页时丢弃旧页缩略图以节省内存）">
+          <label>每页</label>
+          <input type="number" id="page-size-input" min="10" max="500" step="10" value="60" style="width:56px">
+          <span>张</span>
+        </span>
+        <select id="sort-select">
+          <option value="name">按名称</option>
+          <option value="date">按入库时间</option>
+          <option value="size">按大小</option>
+          <option value="mtime">按修改时间</option>
+        </select>
+        <button id="btn-tag" class="btn" title="对选中项或当前目录打标">🏷 打标</button>
+        <button id="btn-view" class="btn" title="查看选中项">👁 查看</button>
+        <button id="btn-manual-tags" class="btn" title="手动添加/移除标签">✎ 标签</button>
+        <button id="btn-delete-sel" class="btn" title="从数据库中删除选中项（不删除磁盘文件）">🗑 删除选中</button>
+        <button id="btn-clear-sel" class="btn">清除选择</button>
+      </div>
+    </div>
+    <div id="gallery" class="gallery"></div>
+    <div id="loadmore-wrap" class="pager-wrap">
+      <button id="btn-page-first" class="btn" title="第一页">⏮ 首页</button>
+      <button id="btn-page-prev" class="btn" title="上一页">◀ 上一页</button>
+      <span class="pager-info">第 <span id="pager-current">1</span> / <span id="pager-total">1</span> 页</span>
+      <input type="number" id="pager-goto" min="1" value="1" style="width:56px" title="跳转到第几页">
+      <button id="btn-page-goto" class="btn">跳转</button>
+      <button id="btn-page-next" class="btn" title="下一页">下一页 ▶</button>
+      <button id="btn-page-last" class="btn" title="最后一页">末页 ⏭</button>
+    </div>
+  </section>
+
+  <!-- 最右侧：标签详情侧边栏 -->
+  <aside id="side-panel">
+    <div class="side-head">
+      <span>🏷 标签</span>
+      <button id="btn-panel-close" class="mini-btn" title="收起侧边栏">»</button>
+    </div>
+    <div class="side-body">
+      <div id="panel-target-info" class="panel-info"></div>
+      <div class="form-row panel-add-row">
+        <input id="panel-tag-input" type="text" list="panel-tags-suggest"
+               placeholder="添加标签到所有选中项（回车）">
+        <datalist id="panel-tags-suggest"></datalist>
+        <button id="btn-panel-add-tag" class="btn primary">＋</button>
+      </div>
+      <div id="panel-tags-list" class="tag-chips panel-tags"></div>
+      <div id="panel-empty" class="hint">在左侧点击缩略图或选择多个素材，这里会显示它们的标签。</div>
+    </div>
+  </aside>
+</div>
+
+<!-- ========== 查看器（模态） ========== -->
+<div id="viewer" class="modal hidden">
+  <div class="viewer-top">
+    <span id="viewer-title"></span>
+    <span id="viewer-counter"></span>
+    <div class="viewer-controls">
+      <button class="btn" data-vaction="prev" title="上一张（←）">◀</button>
+      <button class="btn" data-vaction="next" title="下一张（→）">▶</button>
+      <button class="btn" data-vaction="slideshow" title="幻灯片（S）">⏯ 幻灯片</button>
+      <span class="slide-interval">
+        间隔 <input id="slide-interval" type="number" min="1" max="60" value="5" style="width:48px"> 秒
+      </span>
+      <button class="btn" data-vaction="zoom-in" title="放大（+）">＋</button>
+      <button class="btn" data-vaction="zoom-out" title="缩小（-）">－</button>
+      <button class="btn" data-vaction="zoom-fit" title="适应窗口（0）">⤢</button>
+      <button class="btn" data-vaction="fullscreen" title="全屏（F）">⛶</button>
+      <button class="btn close" data-vaction="close" title="关闭（Esc）">✕</button>
+    </div>
+  </div>
+  <div id="viewer-stage">
+    <img id="viewer-img" alt="" draggable="false">
+    <video id="viewer-video" controls preload="metadata"></video>
+    <div id="viewer-hint" class="hidden"></div>
+  </div>
+  <div class="viewer-bottom">
+    <div class="video-controls hidden" id="video-controls">
+      <button class="btn" data-vaction="rewind" title="快退 10 秒">⏪10s</button>
+      <button class="btn" data-vaction="playpause" title="播放/暂停（空格）">⏯</button>
+      <button class="btn" data-vaction="forward" title="快进 10 秒">10s⏩</button>
+      <span>倍速</span>
+      <select id="video-speed">
+        <option value="0.5">0.5x</option>
+        <option value="1" selected>1x</option>
+        <option value="1.5">1.5x</option>
+        <option value="2">2x</option>
+        <option value="4">4x</option>
+      </select>
+      <span>音量</span>
+      <input id="video-volume" type="range" min="0" max="1" step="0.05" value="1">
+    </div>
+    <div id="viewer-tags" class="viewer-tags"></div>
+  </div>
+</div>
+
+<!-- ========== 打标对话框 ========== -->
+<div id="tagger-modal" class="modal hidden">
+  <div class="dialog">
+    <div class="dialog-head">🏷 打标 <button class="btn close" data-close="tagger-modal">✕</button></div>
+    <div class="dialog-body">
+      <div class="form-row">
+        <label>打标工具：</label>
+        <div id="tagger-tools" class="tool-list"></div>
+      </div>
+      <div class="form-row">
+        <label>作用范围：</label>
+        <div id="tagger-scope" class="scope-list"></div>
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" id="tagger-overwrite"> 覆盖该工具的旧标签（仅覆盖非手动标签）</label>
+      </div>
+      <div class="form-row" id="tagger-progress-row" style="display:none">
+        <label>进度：</label>
+        <div class="progress"><div id="tagger-progress-bar" class="progress-bar"></div></div>
+        <span id="tagger-progress-text"></span>
+      </div>
+      <div id="tagger-msg" class="msg"></div>
+    </div>
+    <div class="dialog-foot">
+      <button id="tagger-cancel-job" class="btn" style="display:none">取消任务</button>
+      <button id="tagger-start" class="btn primary">开始打标</button>
+    </div>
+  </div>
+</div>
+
+<!-- ========== 手动标签对话框 ========== -->
+<div id="tags-modal" class="modal hidden">
+  <div class="dialog">
+    <div class="dialog-head">✎ 手动标签 <button class="btn close" data-close="tags-modal">✕</button></div>
+    <div class="dialog-body">
+      <div id="tags-target-info" class="msg"></div>
+      <div class="form-row">
+        <input id="tags-new" type="text" list="tags-suggest" placeholder="输入标签名，回车添加">
+        <datalist id="tags-suggest"></datalist>
+        <button id="tags-add" class="btn primary">添加</button>
+      </div>
+      <div id="tags-list" class="tag-chips"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ========== 设置对话框 ========== -->
+<div id="settings-modal" class="modal hidden">
+  <div class="dialog wide">
+    <div class="dialog-head">⚙ 设置 <button class="btn close" data-close="settings-modal">✕</button></div>
+    <div class="dialog-body">
+      <div class="tabs">
+        <button class="tab active" data-tab="proxy">代理</button>
+        <button class="tab" data-tab="tagger">打标</button>
+        <button class="tab" data-tab="video">视频</button>
+        <button class="tab" data-tab="download">模型下载</button>
+        <button class="tab" data-tab="deps">依赖更新</button>
+        <button class="tab" data-tab="tasks">任务</button>
+      </div>
+
+      <!-- 代理 -->
+      <div class="tab-pane active" id="tab-proxy">
+        <div class="form-row"><label><input type="checkbox" id="set-proxy-enabled"> 启用代理</label></div>
+        <div class="form-row"><label>类型</label>
+          <select id="set-proxy-type"><option value="http">HTTP</option><option value="socks5">SOCKS5</option></select>
+        </div>
+        <div class="form-row"><label>主机</label><input id="set-proxy-host" type="text" placeholder="127.0.0.1"></div>
+        <div class="form-row"><label>端口</label><input id="set-proxy-port" type="text" placeholder="7890"></div>
+        <div class="form-row"><label>用户名（可选）</label><input id="set-proxy-user" type="text"></div>
+        <div class="form-row"><label>密码（可选）</label><input id="set-proxy-pass" type="password"></div>
+        <div class="form-row"><button id="btn-test-proxy" class="btn">测试代理连通性</button>
+          <span id="proxy-test-result" class="msg"></span></div>
+        <div class="hint">代理用于：模型下载（HuggingFace）、LLM 打标接口、pip 更新依赖。</div>
+      </div>
+
+      <!-- 打标 -->
+      <div class="tab-pane" id="tab-tagger">
+        <div class="form-row"><label>并行打标量</label>
+          <input id="set-tagging-parallel" type="number" min="1" max="64" value="4"></div>
+        <div class="hint">每次批量处理的素材数，图片与视频共用：GPU 下为 batch 推理大小，
+          CPU 下为线程池并发数。调大可显著提升打标速度（5090 建议 4~8，显存充足可到 16）。</div>
+        <div class="tool-configs" id="tool-configs"></div>
+      </div>
+
+      <!-- 视频 -->
+      <div class="tab-pane" id="tab-video">
+        <div class="form-row"><label>打标抽帧间隔（秒）</label>
+          <input id="set-video-interval" type="number" min="0.1" step="0.1" value="5"></div>
+        <div class="form-row"><label>最多抽帧数（0=不限制）</label>
+          <input id="set-video-maxframes" type="number" min="0" value="20"></div>
+        <div class="form-row"><label>视频缩略图取帧位置（秒）</label>
+          <input id="set-video-thumbsec" type="number" min="0" step="0.1" value="1"></div>
+        <div class="form-row"><label>缩略图尺寸（像素）</label>
+          <input id="set-thumb-size" type="number" min="64" value="320"></div>
+          <div class="form-row"><label>缩略图缓存上限（MB）</label>
+            <input id="set-thumb-cache-limit" type="number" min="0" step="50" value="200"></div>
+          <div class="hint">0 = 不限制；超限时自动清理最久未访问的缩略图（LRU）。
+            默认 200MB ≈ 数千张缩略图，比 1GB 更合理。首次点击素材时生成缩略图，
+            生成过就保留，翻回已访问页会从缓存快速读取。</div>
+        <div class="form-row"><label>后台缺失校验间隔（秒，0=关闭）</label>
+          <input id="set-verify-interval" type="number" min="0" value="60"></div>
+      </div>
+
+      <!-- 模型下载 -->
+      <div class="tab-pane" id="tab-download">
+        <div class="form-row"><label>HF 访问令牌</label>
+          <input id="dl-hf-token" type="password" placeholder="hf_xxxx（下载 gated 受限模型如 cl_tagger_v2 时需要）"
+                 autocomplete="off" style="flex:1">
+          <button id="btn-toggle-token" class="btn" title="显示/隐藏令牌">👁</button>
+        </div>
+        <div class="form-row"><label>目标工具</label>
+          <select id="dl-tool">
+            <option value="cl_tagger">cl-tagger</option>
+            <option value="wd14">wd14</option>
+          </select></div>
+        <div class="form-row"><label>HuggingFace 仓库</label>
+          <input id="dl-repo" type="text" placeholder="如 cella110n/cl_tagger 或 SmilingWolf/wd-swinv2-tagger-v3"></div>
+        <div class="form-row"><button id="btn-download-model" class="btn primary">开始下载</button></div>
+        <div class="hint">自动下载模型文件到 data/models/&lt;工具名&gt;/，并自动把该工具的 model_dir 指向下载目录。
+          cl-tagger 仓库（cella110n/cl_tagger、cella110n/cl_tagger_v2）会下载
+          cl_tagger.onnx + cl_tagger_tag_mapping.json；wd14 仓库会下载 model.onnx + selected_tags.csv。
+          若仓库结构特殊或受限（如 v2 需授权），请手动下载模型后到“打标”页配置 model_dir。</div>
+      </div>
+
+      <!-- 依赖更新 -->
+      <div class="tab-pane" id="tab-deps">
+        <div class="form-row" style="flex-direction:column;align-items:flex-start;gap:6px">
+          <div style="font-weight:600">🚀 GPU 加速（NVIDIA 显卡必看）</div>
+          <div class="hint" style="margin-top:0">当前使用 CPU 推理（慢）。安装 onnxruntime-directml 后
+            打标将走 GPU（DirectML），速度提升数十倍。程序会自动卸载冲突的普通 onnxruntime 并安装 DirectML 版。</div>
+        </div>
+        <div class="form-row"><button id="btn-install-directml" class="btn primary">一键安装 DirectML（GPU 加速）</button></div>
+        <hr style="border-color:var(--border);margin:12px 0">
+        <div class="form-row"><label>要安装/更新的包（空格或逗号分隔）</label>
+          <input id="deps-packages" type="text" value="fastapi uvicorn requests pillow numpy"></div>
+        <div class="form-row"><button id="btn-update-deps" class="btn primary">更新依赖</button></div>
+      </div>
+
+      <!-- 任务 -->
+      <div class="tab-pane" id="tab-tasks">
+        <button id="btn-refresh-jobs" class="btn">刷新任务列表</button>
+        <div id="jobs-list" class="jobs-list"></div>
+      </div>
+    </div>
+    <div class="dialog-foot">
+      <button id="btn-save-settings" class="btn primary">保存设置</button>
+    </div>
+  </div>
+</div>
+
+<!-- ========== 通用确认/输入对话框 ========== -->
+<div id="prompt-modal" class="modal hidden">
+  <div class="dialog">
+    <div class="dialog-head"><span id="prompt-title">输入</span></div>
+    <div class="dialog-body">
+      <input id="prompt-input" type="text" style="width:100%">
+      <div id="prompt-msg" class="msg"></div>
+    </div>
+    <div class="dialog-foot">
+      <button id="prompt-cancel" class="btn">取消</button>
+      <button id="prompt-ok" class="btn primary">确定</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="hidden"></div>
+
+<script src="js/api.js"></script>
+<script src="js/app.js"></script>
+<script src="js/tree.js"></script>
+<script src="js/gallery.js"></script>
+<script src="js/viewer.js"></script>
+<script src="js/tagger.js"></script>
+<script src="js/tags.js"></script>
+<script src="js/panel.js"></script>
+<script src="js/settings.js"></script>
+
+<div id="diag-result" style="display:none">pending</div>
+<script>
+setTimeout(async () => {
+  const diag = document.getElementById("diag-result");
+  const tryCount = 0;
+  // 等待初始化完成
+  const waitInit = () => new Promise(res => {
+    const check = () => {
+      const ri = document.getElementById("result-info").textContent;
+      if (ri.includes("共")) res(); else setTimeout(check, 300);
+    };
+    check();
+  });
+  await waitInit();
+  const before = document.getElementById("result-info").textContent;
+  const firstId1 = document.querySelector(".media-card")?.dataset?.id;
+  // 点击下一页
+  document.getElementById("btn-page-next").click();
+  await new Promise(r => setTimeout(r, 2000));
+  const after = document.getElementById("result-info").textContent;
+  const firstId2 = document.querySelector(".media-card")?.dataset?.id;
+  const pagerCurrent = document.getElementById("pager-current").textContent;
+  diag.textContent = "DIAG:" + JSON.stringify({
+    before, after, firstId1, firstId2, pagerCurrent,
+    pageChanged: firstId1 !== firstId2,
+  });
+}, 8000);
+</script>
+</body>
+</html>

@@ -70,7 +70,7 @@ const App = {
     document.getElementById("btn-manual-tags").onclick = () => TagsEditor.open();
     document.getElementById("btn-clear-sel").onclick = () => Gallery.clearSelection();
     document.getElementById("btn-delete-sel").onclick = () => this.deleteSelected();
-    document.getElementById("btn-loadmore").onclick = () => Gallery.load(false);
+
     document.getElementById("sort-select").onchange = () => Gallery.load(true);
 
     // 点击空白处关闭右键菜单
