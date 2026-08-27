@@ -61,6 +61,24 @@ def open_browser(url: str) -> None:
     webbrowser.open(url)
 
 
+def find_free_port(host: str, start_port: int) -> int:
+    """探测可用端口：若 start_port 被占用，依次尝试 start_port+1, +2, ...（最多 +50）。
+    返回一个可绑定的端口。若全部被占用则返回原端口（交给 uvicorn 处理并报错）。"""
+    import socket
+    for offset in range(51):
+        port = start_port + offset
+        if port > 65535:
+            break
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((host, port))
+                return port   # 能绑定说明可用
+            except OSError:
+                continue      # 被占用，尝试下一个
+    return start_port
+
+
 def main() -> None:
     args = parse_args()
 
@@ -73,14 +91,15 @@ def main() -> None:
     from app.config import AppConfig
     config = AppConfig()
     port = args.port or config.get_int("port", 8000)
-    if args.port:
-        config.set("port", str(port))  # 显式指定端口则写回配置，下次启动沿用
 
-    # 3. 构建 FastAPI 应用（启动时自动拉起后台校验线程）
+    # 3. 端口探测：若被占用（如上次残留进程），自动尝试下一个可用端口
+    port = find_free_port(args.host, port)
+
+    # 4. 构建 FastAPI 应用（启动时自动拉起后台校验线程）
     from app.server import create_app
     app = create_app(config)
 
-    # 4. 启动服务器（放在主线程，浏览器用定时器延迟打开）
+    # 5. 启动服务器（放在主线程，浏览器用定时器延迟打开）
     import uvicorn
     url = f"http://{args.host}:{port}"
     if not args.no_browser:

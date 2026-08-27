@@ -63,15 +63,19 @@ const Gallery = {
       App.state.lastAnchor = null;
       // 1) 立即渲染卡片框架（文件名等），不阻塞
       this.render();
-      // 2) 立刻启动缩略图加载（视口内优先，异步进行）
-      this._abortCtrl = new AbortController();
-      this.loadVisibleThumbs(this._abortCtrl.signal);
-      // 3) 更新 UI 状态
+      // 2) 立即更新 UI 状态（页码/统计/选择）——优先于缩略图加载，绝不因缩略图中断
       this.updatePager();
       this.updateResultInfo();
       this.updateSelInfo();
       this.scrollTop();
       this.saveBrowseState();
+      // 3) 启动缩略图加载（视口内优先，异步），用 try/catch 保底——失败不影响 UI
+      this._abortCtrl = new AbortController();
+      try {
+        this.loadVisibleThumbs(this._abortCtrl.signal);
+      } catch (e) {
+        console.warn("缩略图加载启动异常（不影响浏览）：", e);
+      }
     } catch (e) {
       if (e.status === 410) {
         toast("部分文件已被外部删除，记录已自动清理", "err");
@@ -134,7 +138,7 @@ const Gallery = {
       }, { rootMargin: "200px 0px", threshold: 0.01 });
     }
     // 对未加载的缩略图重新注册观察
-    document.querySelectorAll(".thumb-img[data-loaded!='1']").forEach(im => {
+    document.querySelectorAll(".thumb-img:not([data-loaded='1'])").forEach(im => {
       if (this._thumbObserver) this._thumbObserver.observe(im);
     });
   },
