@@ -376,3 +376,23 @@ body.selecting { user-select: none; cursor: crosshair; }
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* ---------- 导入进度条 ---------- */
+#import-progress-bar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 6px 14px; background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+}
+#import-progress-bar.hidden { display: none; }
+#import-progress-bar .import-progress-inner {
+  flex: 1; height: 8px; background: var(--bg);
+  border-radius: 4px; overflow: hidden;
+}
+#import-progress-bar .import-progress-fill {
+  height: 100%; width: 0%;
+  background: linear-gradient(90deg, var(--accent), #7cb3ff);
+  transition: width .2s ease;
+}
+#import-progress-bar #import-progress-text {
+  color: var(--text-dim); font-size: 12px; white-space: nowrap;
+}

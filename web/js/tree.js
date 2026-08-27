@@ -3,8 +3,10 @@
  * 职责：
  *   1. 从后端 /api/tree 读取目录树（纯数据库构建，启动优先）；
  *   2. 渲染树形结构，点击节点切换筛选；
- *   3. 右键菜单：重新扫描 / 从库中移除 / 校验缺失 / 整个目录打标；
- *   4. 点击目录时先校验磁盘是否存在，不存在则自动清理并刷新。
+ *   3. 右键菜单：重新扫描 / 从库中移除 / 校验缺失 / 整个目录打标 / 添加图片；
+ *   4. 点击目录时先校验磁盘是否存在，不存在则自动清理并刷新；
+ *   5. 展开状态保存在 App.state.expandedFolders，点击节点或重新渲染
+ *      都不会丢失已展开的子目录（修复"点子目录整树收起"问题）。
  * ============================================================ */
 const TreeView = {
   /** 刷新目录树（重新请求后端） */
@@ -25,11 +27,12 @@ const TreeView = {
     // “全部媒体”根节点
     const allNode = document.createElement("div");
     allNode.className = "tree-node" + (App.state.currentFolderId === null ? " active" : "");
+    allNode.dataset.folderId = "all";
     allNode.innerHTML = '<span class="caret">▾</span><span class="label">📁 全部媒体</span>';
     allNode.onclick = () => {
       App.state.currentFolderId = null;
       Gallery.load(true);
-      this.render();
+      this.updateActiveHighlight(null);
     };
     box.appendChild(allNode);
 
@@ -46,14 +49,16 @@ const TreeView = {
     }
   },
 
-  /** 递归渲染单个节点 */
+  /** 递归渲染单个节点（按 expandedFolders 恢复展开状态） */
   renderNode(parent, node, depth) {
     const hasKids = node.children && node.children.length > 0;
+    const isExpanded = App.state.expandedFolders.has(node.id);
     const div = document.createElement("div");
     div.className = "tree-node" + (App.state.currentFolderId === node.id ? " active" : "");
+    div.dataset.folderId = node.id;
     div.style.paddingLeft = (6 + depth * 14) + "px";
     div.innerHTML =
-      '<span class="caret">' + (hasKids ? "▸" : "·") + "</span>" +
+      '<span class="caret">' + (hasKids ? (isExpanded ? "▾" : "▸") : "·") + "</span>" +
       '<span class="label" title="' + escapeHtml(node.path) + '">📁 ' + escapeHtml(node.name) + "</span>" +
       '<span class="count">' + (node.media_count || "") + "</span>";
     // 点击目录：先校验磁盘存在性（不存在则后端自动清理），再切换筛选
@@ -70,7 +75,8 @@ const TreeView = {
       } catch (err) { /* 网络错误不阻塞切换 */ }
       App.state.currentFolderId = node.id;
       Gallery.load(true);
-      this.render();
+      // 只更新高亮，不重建整树（保留展开状态）
+      this.updateActiveHighlight(node.id);
       SidePanel.refresh();
     };
     // 右键菜单
@@ -81,23 +87,42 @@ const TreeView = {
     };
     parent.appendChild(div);
 
-    // 子节点容器（默认折叠）
+    // 子节点容器（按展开状态显示）
     if (hasKids) {
       const kids = document.createElement("div");
-      kids.className = "tree-children hidden";
+      kids.className = "tree-children" + (isExpanded ? "" : " hidden");
       kids.dataset.parent = node.id;
       parent.appendChild(kids);
-      // 点击箭头展开/折叠
+      // 展开时渲染子节点
+      if (isExpanded) {
+        for (const child of node.children) this.renderNode(kids, child, depth + 1);
+      }
+      // 点击箭头展开/折叠（维护 expandedFolders 状态）
       div.querySelector(".caret").onclick = (e) => {
         e.stopPropagation();
-        const isHidden = kids.classList.toggle("hidden");
-        div.querySelector(".caret").textContent = isHidden ? "▸" : "▾";
-        if (!isHidden) {
-          kids.innerHTML = "";
-          for (const child of node.children) this.renderNode(kids, child, depth + 1);
+        const willExpand = kids.classList.toggle("hidden");
+        div.querySelector(".caret").textContent = willExpand ? "▸" : "▾";
+        if (willExpand) {
+          App.state.expandedFolders.delete(node.id);
+        } else {
+          App.state.expandedFolders.add(node.id);
+          if (kids.children.length === 0) {
+            for (const child of node.children) this.renderNode(kids, child, depth + 1);
+          }
         }
       };
     }
+  },
+
+  /** 只更新目录树的高亮选中态（不重建整树） */
+  updateActiveHighlight(folderId) {
+    document.querySelectorAll("#tree .tree-node").forEach(n => {
+      const target = folderId === null ? "all" : String(folderId);
+      const shouldActive = n.dataset.folderId === target;
+      if (n.classList.contains("active") !== shouldActive) {
+        n.classList.toggle("active", shouldActive);
+      }
+    });
   },
 
   /** 右键菜单 */
@@ -110,9 +135,16 @@ const TreeView = {
     menu.style.top = e.clientY + "px";
 
     const items = [
-      { label: "查看此目录", fn: () => { App.state.currentFolderId = node.id; Gallery.load(true); this.render(); } },
+      { label: "查看此目录", fn: () => {
+        App.state.currentFolderId = node.id;
+        Gallery.load(true);
+        this.updateActiveHighlight(node.id);
+      } },
       { label: "重新扫描", fn: () => this.rescan(node) },
-      { label: "整个目录打标…", fn: () => { App.state.currentFolderId = node.id; Tagger.openWithFolder(node.id); } },
+      { label: "整个目录打标…", fn: () => {
+        App.state.currentFolderId = node.id;
+        Tagger.openWithFolder(node.id);
+      } },
       { label: "添加图片到该目录…", fn: () => this.addMedia(node) },
       { label: "校验缺失", fn: () => this.verify(node) },
       { label: "从库中移除（仅删记录）", fn: () => this.remove(node) },

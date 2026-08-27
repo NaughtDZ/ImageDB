@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import threading
+import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -125,6 +126,67 @@ class ModelDownloadRequest(BaseModel):
 
 class DepsUpdateRequest(BaseModel):
     packages: str = "fastapi uvicorn requests pillow numpy"
+
+
+# ---------------- 导入任务存储（内存） ----------------
+# 用于后台导入任务的进度跟踪：job_id -> {status, progress, total, done, message, started_at}
+IMPORT_JOBS: dict[str, dict] = {}
+IMPORT_JOBS_LOCK = threading.Lock()
+
+
+def _new_import_job(path: str) -> str:
+    """创建导入任务记录，返回 job_id。"""
+    import uuid
+    jid = uuid.uuid4().hex[:12]
+    with IMPORT_JOBS_LOCK:
+        IMPORT_JOBS[jid] = {
+            "id": jid,
+            "path": path,
+            "status": "counting",   # counting -> importing -> done/failed
+            "progress": 0,          # 0~100
+            "total": 0,             # 预估总文件数
+            "done": 0,              # 已导入数
+            "message": "正在统计文件……",
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    return jid
+
+
+def _update_import_job(jid: str, **kwargs) -> None:
+    with IMPORT_JOBS_LOCK:
+        if jid in IMPORT_JOBS:
+            IMPORT_JOBS[jid].update(kwargs)
+
+
+def _import_worker(jid: str, path: str) -> None:
+    """后台导入工作线程：先多线程统计总数，再逐目录导入并更新进度。"""
+    try:
+        # 阶段 1：多线程快速统计（预估总文件数）
+        _update_import_job(jid, status="counting", message="正在统计文件数量……")
+        total_dirs, total_files = library.count_media_files(path)
+        _update_import_job(jid, status="importing", total=total_files,
+                           message=f"统计完成：{total_files} 个媒体文件，开始导入……")
+        logger.info("导入前统计：目录 %d 个，媒体 %d 个", total_dirs, total_files)
+        if total_files == 0:
+            _update_import_job(jid, status="done", progress=100,
+                               message="该目录下没有找到图片或视频")
+            return
+
+        # 阶段 2：导入（内部每批写入后通过回调更新进度）
+        result = library.import_folder_progress(
+            path,
+            progress_cb=lambda done: _update_import_job(
+                jid, done=done,
+                progress=min(100, round(done / max(total_files, 1) * 100)),
+            ),
+        )
+        _update_import_job(jid, status="done", progress=100,
+                           message=f"导入完成：新增 {result['media_added']} 个媒体文件")
+    except ValueError as exc:
+        _update_import_job(jid, status="failed", message=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("导入任务异常：%s", exc)
+        _update_import_job(jid, status="failed", message=f"导入失败：{exc}")
 
 
 # ---------------- 内部辅助 ----------------
@@ -293,13 +355,32 @@ def create_app(config: AppConfig) -> FastAPI:
         return library.build_tree()
 
     @app.post("/api/library/import")
+    @app.post("/api/library/import")
     def api_import(req: ImportRequest) -> dict:
-        """导入目录（递归扫描图片/视频路径入库，不做打标）。"""
-        try:
-            return library.import_folder(req.path)
-        except ValueError as exc:
-            raise HTTPException(400, str(exc))
+        """导入目录（后台任务）：先多线程统计文件数，再逐目录导入，带进度条。"""
+        path = os.path.abspath(req.path)
+        if not os.path.isdir(path):
+            raise HTTPException(400, f"目录不存在：{path}")
+        jid = _new_import_job(path)
+        t = threading.Thread(target=_import_worker, args=(jid, path),
+                             daemon=True, name=f"import-{jid}")
+        t.start()
+        return {"job_id": jid}
 
+    @app.get("/api/library/import/jobs")
+    def api_import_jobs() -> dict:
+        """导入任务列表（含进度）。"""
+        with IMPORT_JOBS_LOCK:
+            return {"jobs": [dict(v) for v in IMPORT_JOBS.values()]}
+
+    @app.get("/api/library/import/jobs/{jid}")
+    def api_import_job(jid: str) -> dict:
+        """单个导入任务进度。"""
+        with IMPORT_JOBS_LOCK:
+            job = IMPORT_JOBS.get(jid)
+            if job is None:
+                raise HTTPException(404, "任务不存在")
+            return dict(job)
     @app.post("/api/library/rescan")
     def api_rescan(req: FolderIdRequest) -> dict:
         """重新扫描目录：补录新增、清理缺失。"""

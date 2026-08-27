@@ -12,6 +12,7 @@ const App = {
     pageSize: 60,
     selected: new Set(),   // 选中的媒体 id 集合
     lastAnchor: null,      // 上次单击的媒体 id（Shift 区间选择的锚点）
+    expandedFolders: new Set(),  // 目录树展开状态（展开的节点 id 集合）
     filters: { q: "", dir: "", tags: "", type: "" },
   },
 
@@ -94,18 +95,50 @@ const App = {
     const path = await promptDialog({
       title: "导入目录",
       message: "输入要导入的目录绝对路径（将递归扫描其中的图片/视频路径并入库）：",
-      placeholder: "例如 D:\Pictures\收藏",
+      placeholder: "例如 D:\\Pictures\\收藏",
       okText: "导入",
     });
     if (!path) return;
     try {
+      // 启动后台导入任务（多线程统计 + 逐目录导入，带进度条）
       const res = await API.post("/api/library/import", { path });
-      toast("导入完成：新增媒体 " + res.media_added + " 个", "ok");
-      await TreeView.refresh();
-      await Gallery.load(true);
+      this.showImportProgress(res.job_id);
     } catch (e) {
-      toast("导入失败：" + e.message, "err");
+      toast("导入启动失败：" + e.message, "err");
     }
+  },
+
+  /** 显示导入进度条并轮询进度 */
+  showImportProgress(jobId) {
+    const bar = document.getElementById("import-progress-bar");
+    const fill = document.getElementById("import-progress-fill");
+    const text = document.getElementById("import-progress-text");
+    bar.classList.remove("hidden");
+    fill.style.width = "0%";
+
+    const poll = async () => {
+      try {
+        const job = await API.get("/api/library/import/jobs/" + jobId);
+        fill.style.width = (job.progress || 0) + "%";
+        text.textContent = job.message || "";
+        if (job.status === "done" || job.status === "failed") {
+          bar.classList.add("hidden");
+          if (job.status === "done") {
+            toast(job.message || "导入完成", "ok");
+          } else {
+            toast(job.message || "导入失败", "err");
+          }
+          await TreeView.refresh();
+          await Gallery.load(true);
+          return;
+        }
+        setTimeout(poll, 400);
+      } catch (e) {
+        bar.classList.add("hidden");
+        toast("导入进度获取失败：" + e.message, "err");
+      }
+    };
+    poll();
   },
 
   /** 重新扫描当前目录 */

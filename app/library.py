@@ -119,6 +119,66 @@ def _walk_and_insert(dir_path: str, parent_db_id: int, seen: set[str]) -> tuple[
     return folders_added, media_added
 
 
+def count_media_files(root_path: str) -> tuple[int, int]:
+    """
+    多线程快速统计目录树：返回 (子目录数, 媒体文件数)。
+    只做 scandir 遍历，不写数据库，速度快，用于导入前的进度预估。
+    """
+    import concurrent.futures as cf
+    total_dirs = [0]
+    total_files = [0]
+    seen = {os.path.realpath(root_path)}
+
+    def count_dir(dir_path: str) -> tuple[int, int]:
+        """统计单个目录：返回 (子目录数, 媒体文件数)。"""
+        dirs = 0
+        files = 0
+        try:
+            with os.scandir(dir_path) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            dirs += 1
+                        elif entry.is_file(follow_symlinks=False):
+                            if media_type_of(entry.path):
+                                files += 1
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        return dirs, files
+
+    # 第一遍：收集所有目录路径（单线程收集，避免符号链接循环）
+    all_dirs = [root_path]
+    queue = [root_path]
+    while queue:
+        cur = queue.pop()
+        try:
+            with os.scandir(cur) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            real = os.path.realpath(entry.path)
+                            if real in seen:
+                                continue
+                            seen.add(real)
+                            all_dirs.append(entry.path)
+                            queue.append(entry.path)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+
+    # 第二遍：多线程并行统计每个目录的文件数
+    workers = min(16, max(4, (os.cpu_count() or 4) * 2))
+    with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(count_dir, all_dirs))
+    for d, f in results:
+        total_dirs[0] += d
+        total_files[0] += f
+    return total_dirs[0], total_files[0]
+
+
 def import_folder(root_path: str) -> dict:
     """
     导入一个目录（及其全部子目录）：
@@ -140,6 +200,90 @@ def import_folder(root_path: str) -> dict:
     folders_added, media_added = _walk_and_insert(root_path, root_id, seen)
 
     # 重新统计该根目录下的媒体总数
+    total = query_one(
+        """SELECT COUNT(*) AS c FROM media_items
+           WHERE folder_id IN (
+               WITH RECURSIVE sub(id) AS (
+                   SELECT id FROM folders WHERE id = ?
+                   UNION ALL
+                   SELECT f.id FROM folders f JOIN sub s ON f.parent_id = s.id
+               ) SELECT id FROM sub)""",
+        (root_id,),
+    )["c"]
+    logger.info("导入完成：目录 %d 个，新增媒体 %d 个，库内总计 %d 个",
+                folders_added, media_added, total)
+    return {"folder_id": root_id, "folders_added": folders_added,
+            "media_added": media_added, "media_total": total}
+
+
+def import_folder_progress(root_path: str, progress_cb=None) -> dict:
+    """
+    带进度回调的导入：先插入根目录，再递归扫描写入，每处理完一个目录
+    调用 progress_cb(done_count) 更新进度。progress_cb 接收已处理的媒体数。
+    返回与 import_folder 相同的统计信息。
+    """
+    root_path = os.path.abspath(root_path)
+    if not os.path.isdir(root_path):
+        raise ValueError(f"目录不存在：{root_path}")
+
+    root_id = _insert_folder(
+        os.path.basename(root_path.rstrip(os.sep)) or root_path,
+        root_path, None, is_root=1,
+    )
+    logger.info("开始导入目录：%s", root_path)
+
+    done_counter = {"n": 0}
+    folders_added = 0
+    media_added = 0
+
+    def walk(dir_path, parent_db_id):
+        """递归扫描写入（带进度回调）。"""
+        nonlocal folders_added, media_added
+        try:
+            entries = list(os.scandir(dir_path))
+        except OSError as exc:
+            logger.warning("无法读取目录 %s：%s", dir_path, exc)
+            return
+        media_rows: list[tuple] = []
+        subdirs: list[os.DirEntry] = []
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    subdirs.append(entry)
+                elif entry.is_file(follow_symlinks=False):
+                    mtype = media_type_of(entry.path)
+                    if mtype:
+                        st = entry.stat(follow_symlinks=False)
+                        media_rows.append((
+                            parent_db_id, entry.path, entry.name, mtype,
+                            ext_of(entry.path), st.st_size, st.st_mtime,
+                        ))
+            except OSError:
+                continue
+        if media_rows:
+            executemany(
+                """INSERT OR IGNORE INTO media_items
+                   (folder_id, path, filename, type, ext, size, mtime)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                media_rows,
+            )
+            media_added += len(media_rows)
+            done_counter["n"] += len(media_rows)
+            if progress_cb:
+                progress_cb(done_counter["n"])
+
+        for entry in subdirs:
+            real = os.path.realpath(entry.path)
+            if real in seen_set:
+                continue
+            seen_set.add(real)
+            sub_id = _insert_folder(entry.name, entry.path, parent_db_id)
+            folders_added += 1
+            walk(entry.path, sub_id)
+
+    seen_set: set[str] = {os.path.realpath(root_path)}
+    walk(root_path, root_id)
+
     total = query_one(
         """SELECT COUNT(*) AS c FROM media_items
            WHERE folder_id IN (
