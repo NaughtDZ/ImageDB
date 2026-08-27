@@ -24,3 +24,6 @@ __pycache__/
 test_media/
 _prov_test.jpg
 *.tmp
+
+# 诊断/测试临时文件
+*_diag.html
