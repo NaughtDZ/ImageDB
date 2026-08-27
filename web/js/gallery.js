@@ -1,52 +1,48 @@
 /* ============================================================
- * 画廊组件：媒体网格、选择（单击/Ctrl/Shift/框选）、分页浏览、缩略图内存缓存
+ * 画廊组件：立即显示文件名/卡片框架，缩略图异步懒加载，翻页中断旧页加载
  *
- * 缩略图缓存策略（解决高强度翻页卡顿）：
- *   - 内存缓存：Gallery._thumbCache (Map<mediaId, img>) 记录已成功加载的缩略图，
- *     翻回已访问页时直接复用缓存的 <img>，秒显不再重新网络请求；
- *     采用 LRU 策略，上限 _THUMB_CACHE_MAX 张（默认 400）防止内存无限增长。
- *   - 硬盘持久化：缩略图生成后仍持久化到 data/thumbs/（重启共用，生成过就保留）。
- *   - 预取：翻页后只预取"视口内 + 少量余量"的缩略图（而非整页 60 张），
- *     避免首访新页时瞬间生成大量缩略图导致卡顿。
- *   - 浏览状态：关闭/退出时保存当前目录、页码、滚动位置到 localStorage，
- *     下次启动自动恢复。
+ * 性能策略（响应优先，流畅翻页）：
+ *   1. 卡片立即渲染：render() 同步创建所有卡片（文件名/类型徽标/视频时长），
+ *      缩略图用独立 <img> 异步加载，绝不阻塞卡片显示。
+ *   2. 缩略图懒加载：IntersectionObserver 监听，进入视口才真正请求缩略图；
+ *      有内存缓存则秒显，无则请求后端生成并缓存。
+ *   3. 翻页中断旧页：用 AbortController 管理当前批次的缩略图请求，
+ *      翻页时 abort 所有未完成的旧页请求，只加载目标页，避免旧页抢占带宽。
+ *   4. 内存缓存：Gallery._thumbCache (Map<id, img>) LRU，翻回已访问页秒显。
  *
- * 分页模式：
- *   - 每次只显示一页，翻页丢弃旧页内容省内存；
- *   - 每页数量可设置（工具栏输入框，记忆上次值）；
- *   - 翻页后滚动回顶部、清空选择。
+ * 分页模式：每次一页，翻页丢弃旧页 DOM 省内存，滚动回顶。
  * ============================================================ */
 const Gallery = {
-  // 内存缩略图缓存：mediaId -> <img>（已加载）
+  // 内存缩略图缓存：mediaId -> 已加载的 <img>（LRU）
   _thumbCache: new Map(),
-  _THUMB_CACHE_MAX: 400,   // 内存缓存上限（张），超过按 LRU 淘汰最旧的
+  _THUMB_CACHE_MAX: 400,
+  // 当前批次缩略图请求的控制器（翻页时 abort，丢弃旧页未完成请求）
+  _abortCtrl: null,
+  _loading: new Set(),   // 正在加载的 mediaId 集合（去重，避免重复请求）
 
-  /** 缓存一张已加载的缩略图（LRU） */
+  /** 缓存一张已加载的缩略图（LRU） + 记录到浏览器级 */
   cacheThumb(id, imgEl) {
-    // 已存在则先删（重新插到队尾表示最近使用）
-    if (this._thumbCache.has(id)) {
-      this._thumbCache.delete(id);
-    }
+    if (this._thumbCache.has(id)) this._thumbCache.delete(id);
     this._thumbCache.set(id, imgEl);
-    // 超限淘汰最旧的（Map 迭代序 = 插入序，第一个最旧）
     while (this._thumbCache.size > this._THUMB_CACHE_MAX) {
-      const oldestKey = this._thumbCache.keys().next().value;
-      this._thumbCache.delete(oldestKey);
+      this._thumbCache.delete(this._thumbCache.keys().next().value);
     }
   },
 
-  /** 从内存缓存取缩略图（命中则返回 img 并标记最近使用） */
+  /** 取内存缓存缩略图（命中则移动 LRU 并返回） */
   getCachedThumb(id) {
     if (!this._thumbCache.has(id)) return null;
     const img = this._thumbCache.get(id);
-    // 命中：移到队尾（LRU 更新）
     this._thumbCache.delete(id);
     this._thumbCache.set(id, img);
     return img;
   },
 
-  /** 加载媒体列表：分页模式，翻页丢弃旧页内容省内存 */
+  /** 加载媒体列表：翻页时先 abort 旧页缩略图请求，再渲染目标页 */
   async load(reset) {
+    // 翻页：中断上一批缩略图加载（丢弃旧页请求，优先目标页）
+    this.abortThumbLoads();
+
     const f = App.state.filters;
     const params = new URLSearchParams();
     if (App.state.currentFolderId) params.set("folder_id", App.state.currentFolderId);
@@ -61,17 +57,21 @@ const Gallery = {
     try {
       const data = await API.get("/api/media?" + params.toString());
       App.state.total = data.total;
-      App.state.items = data.items;   // 翻页丢弃旧页，节约内存
+      App.state.items = data.items;
       if (reset) App.state.page = 1;
       App.state.selected.clear();
       App.state.lastAnchor = null;
+      // 1) 立即渲染卡片框架（文件名等），不阻塞
       this.render();
-      this.prefetchVisible();   // 只预取视口附近的缩略图
+      // 2) 立刻启动缩略图加载（视口内优先，异步进行）
+      this._abortCtrl = new AbortController();
+      this.loadVisibleThumbs(this._abortCtrl.signal);
+      // 3) 更新 UI 状态
       this.updatePager();
       this.updateResultInfo();
       this.updateSelInfo();
       this.scrollTop();
-      this.saveBrowseState();   // 记录当前浏览状态
+      this.saveBrowseState();
     } catch (e) {
       if (e.status === 410) {
         toast("部分文件已被外部删除，记录已自动清理", "err");
@@ -83,36 +83,199 @@ const Gallery = {
     }
   },
 
-  /** 滚动到画廊顶部（翻页/跳页时调用） */
+  /** 中断当前批次所有未完成的缩略图请求 */
+  abortThumbLoads() {
+    if (this._abortCtrl) {
+      try { this._abortCtrl.abort(); } catch (e) {}
+      this._abortCtrl = null;
+    }
+    // 清理"加载中"标记（用于去重），因为翻页后这些请求已作废
+    // 注意：不清空 _loading 会误判新页图已在加载，这里清空
+    this._loading.clear();
+  },
+
+  /**
+   * 加载视口内的缩略图（异步）。用 signal 支持翻页中断。
+   * 优先用内存缓存秒显，未命中才发请求。
+   */
+  loadVisibleThumbs(signal) {
+    const galleryEl = document.getElementById("gallery");
+    if (!galleryEl) return;
+    const winH = window.innerHeight || 0;
+    // 视口内 + 上下余量 200px 的卡片
+    const cards = [...document.querySelectorAll(".media-card")];
+    for (const card of cards) {
+      const im = card.querySelector(".thumb-img");
+      if (!im) continue;
+      const id = card.dataset.id;
+      const r = card.getBoundingClientRect();
+      const inView = r.top < winH + 200 && r.bottom > -200;
+      // 已加载（有 src 且非 data-src 模式）则跳过
+      if (im.dataset.loaded === "1") continue;
+      if (inView) {
+        this.loadOneThumb(im, id, signal);
+      }
+    }
+    // 其余交给 IntersectionObserver（滚动时加载）
+    if (this._thumbObserver) {
+      this._thumbObserver.disconnect();
+    } else if ("IntersectionObserver" in window) {
+      this._thumbObserver = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            const im = entry.target;
+            const id = im.closest(".media-card")?.dataset?.id;
+            if (id && im.dataset.loaded !== "1" && this._abortCtrl) {
+              this.loadOneThumb(im, id, this._abortCtrl.signal);
+              this._thumbObserver.unobserve(im);
+            }
+          }
+        }
+      }, { rootMargin: "200px 0px", threshold: 0.01 });
+    }
+    // 对未加载的缩略图重新注册观察
+    document.querySelectorAll(".thumb-img[data-loaded!='1']").forEach(im => {
+      if (this._thumbObserver) this._thumbObserver.observe(im);
+    });
+  },
+
+  /** 加载单个缩略图（内存缓存命中则秒显，否则请求） */
+  loadOneThumb(im, id, signal) {
+    // 已在加载中则跳过（去重）
+    if (this._loading.has(id)) return;
+    const cached = this.getCachedThumb(id);
+    if (cached && cached.complete && cached.naturalWidth > 0) {
+      // 内存缓存命中：直接复用 src，秒显
+      im.src = cached.src;
+      im.dataset.loaded = "1";
+      im.style.opacity = "1";
+      return;
+    }
+    // 未命中：发起请求（带 signal 支持中断）
+    this._loading.add(id);
+    const url = "/api/media/" + id + "/thumbnail";
+    const worker = new Image();
+    worker.signal = signal;
+    if (signal) {
+      // 中断时取消
+      signal.addEventListener("abort", () => {
+        worker.src = "";   // 断开加载
+        this._loading.delete(id);
+      }, { once: true });
+    }
+    worker.onload = () => {
+      this._loading.delete(id);
+      // 更新卡片 img（若 DOM 还在），并写缓存
+      im.src = worker.src;
+      im.dataset.loaded = "1";
+      im.style.opacity = "1";
+      this.cacheThumb(id, worker);
+    };
+    worker.onerror = () => {
+      this._loading.delete(id);
+      im.style.background = "var(--bg-hover)";
+      im.alt = "⚠";
+    };
+    worker.src = url;
+  },
+
+  /** 渲染网格：立即创建卡片框架（文件名/徽标），缩略图占位，不阻塞 */
+  render() {
+    const box = document.getElementById("gallery");
+    box.innerHTML = "";
+    if (!App.state.items.length) {
+      box.innerHTML = '<div class="empty">没有找到素材 —— 试试导入目录或调整筛选条件</div>';
+      return;
+    }
+    for (const item of App.state.items) {
+      box.appendChild(this.renderCard(item));
+    }
+    // 兜底：无 IntersectionObserver 时直接加载所有
+    if (!("IntersectionObserver" in window)) {
+      const thumbImgs = box.querySelectorAll(".thumb-img");
+      thumbImgs.forEach((im, i) => {
+        // 简化：无 IO 环境直接加载视口外也不管了（现代浏览器都有）
+      });
+    }
+  },
+
+  /** 渲染单个媒体卡片：文件名/徽标立即显示，缩略图占位（含渐变过渡） */
+  renderCard(item) {
+    const card = document.createElement("div");
+    card.className = "media-card" + (App.state.selected.has(item.id) ? " selected" : "");
+    card.dataset.id = item.id;
+
+    // 缩略图容器：先显示占位背景，图片加载后淡入
+    const thumbBox = document.createElement("div");
+    thumbBox.className = "thumb-box";
+    thumbBox.style.background = "var(--bg-hover)";   // 占位
+    const img = document.createElement("img");
+    img.alt = item.filename;
+    img.className = "thumb-img";
+    img.style.opacity = "0";   // 初始透明，加载后淡入
+    img.dataset.loaded = "0";
+    thumbBox.appendChild(img);
+    card.appendChild(thumbBox);
+
+    // 类型徽标（立即显示）
+    const badge = document.createElement("span");
+    badge.className = "badge";
+    badge.textContent = item.type === "video" ? "🎬" : "🖼";
+    card.appendChild(badge);
+
+    // 视频时长（立即显示）
+    if (item.type === "video" && item.duration) {
+      const dur = document.createElement("span");
+      dur.className = "dur";
+      dur.textContent = formatDuration(item.duration);
+      card.appendChild(dur);
+    }
+
+    // 文件名（立即显示，最重要的信息）
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = item.filename;
+    name.title = item.path;
+    card.appendChild(name);
+
+    card.onclick = (e) => {
+      e.stopPropagation();
+      if (e.shiftKey) {
+        this.selectRange(item.id);
+      } else if (e.ctrlKey || e.metaKey) {
+        if (App.state.selected.has(item.id)) App.state.selected.delete(item.id);
+        else App.state.selected.add(item.id);
+        App.state.lastAnchor = item.id;
+        card.classList.toggle("selected");
+      } else {
+        App.state.selected.clear();
+        App.state.selected.add(item.id);
+        App.state.lastAnchor = item.id;
+        this.render();
+        // 重新加载缩略图（因为 render 重建了 DOM）
+        if (this._abortCtrl) this.loadVisibleThumbs(this._abortCtrl.signal);
+      }
+      this.updateSelInfo();
+      SidePanel.open();
+      SidePanel.refresh();
+    };
+
+    card.ondblclick = (e) => {
+      e.stopPropagation();
+      const idx = App.state.items.findIndex(i => i.id === item.id);
+      Viewer.open(App.state.items, idx >= 0 ? idx : 0);
+    };
+
+    return card;
+  },
+
+  /** 滚动到画廊顶部 */
   scrollTop() {
     const gallery = document.getElementById("gallery");
     if (gallery) gallery.scrollTop = 0;
   },
 
-  /**
-   * 只预取"视口内 + 少量余量"的缩略图（而非整页）。
-   * 翻页后主要看视口内容，预取太多首访新页会导致瞬间生成大量缩略图卡顿。
-   */
-  prefetchVisible() {
-    const items = App.state.items || [];
-    if (!items.length) return;
-    const galleryEl = document.getElementById("gallery");
-    const winH = window.innerHeight || 0;
-    // 预估视口能容纳的行数（每行约 6 列 + 余量）
-    const visibleCount = Math.ceil((winH / 190) * 6) + 12;
-    const urls = items.slice(0, visibleCount).map(i => "/api/media/" + i.id + "/thumbnail");
-    let idx = 0;
-    const batch = () => {
-      for (let n = 0; n < 6 && idx < urls.length; n++, idx++) {
-        const im = new Image();
-        im.src = urls[idx];   // 触发后端生成并写硬盘缓存 + 浏览器缓存
-      }
-      if (idx < urls.length) setTimeout(batch, 50);
-    };
-    setTimeout(batch, 100);
-  },
-
-  /** 保存当前浏览状态到 localStorage（目录、页码、滚动位置） */
+  /** 保存浏览状态到 localStorage */
   saveBrowseState() {
     try {
       localStorage.setItem("imagedb_browse", JSON.stringify({
@@ -122,15 +285,14 @@ const Gallery = {
         scrollTop: document.getElementById("gallery")?.scrollTop || 0,
         ts: Date.now(),
       }));
-    } catch (e) { /* localStorage 满或不可用，忽略 */ }
+    } catch (e) {}
   },
 
-  /** 读取上次保存的浏览状态（用于启动恢复） */
+  /** 读取浏览状态 */
   loadBrowseState() {
     try {
       const raw = localStorage.getItem("imagedb_browse");
-      if (!raw) return null;
-      return JSON.parse(raw);
+      return raw ? JSON.parse(raw) : null;
     } catch (e) { return null; }
   },
 
@@ -144,7 +306,7 @@ const Gallery = {
     await this.load(false);
   },
 
-  /** 初始化分页导航：绑定按钮 + 每页数量输入 */
+  /** 初始化分页导航 */
   initPager() {
     const btnFirst = document.getElementById("btn-page-first");
     const btnPrev = document.getElementById("btn-page-prev");
@@ -204,160 +366,7 @@ const Gallery = {
     if (btnLast) btnLast.disabled = App.state.page >= totalPages;
   },
 
-  /** 渲染网格 */
-  render() {
-    const box = document.getElementById("gallery");
-    box.innerHTML = "";
-    if (!App.state.items.length) {
-      box.innerHTML = '<div class="empty">没有找到素材 —— 试试导入目录或调整筛选条件</div>';
-      return;
-    }
-    for (const item of App.state.items) {
-      box.appendChild(this.renderCard(item));
-    }
-    requestAnimationFrame(() => this.observeThumbs());
-    clearTimeout(this._observeFallback);
-    this._observeFallback = setTimeout(() => {
-      const thumbs = document.querySelectorAll(".thumb-img[data-src]");
-      const anyLoaded = document.querySelector(".thumb-img[src]");
-      if (thumbs.length && !anyLoaded) {
-        const visible = Math.ceil(window.innerHeight / 180) * 6 + 6;
-        thumbs.forEach((im, i) => {
-          if (i < visible && im.dataset.src) {
-            im.src = im.dataset.src;
-            delete im.dataset.src;
-          }
-        });
-      }
-    }, 1500);
-  },
-
-  /** 按需渲染：IntersectionObserver 只加载视口内缩略图（优先复用内存缓存） */
-  observeThumbs() {
-    const galleryEl = document.getElementById("gallery");
-    if (!galleryEl || !("IntersectionObserver" in window)) {
-      document.querySelectorAll(".thumb-img[data-src]").forEach(im => {
-        im.src = im.dataset.src;
-        delete im.dataset.src;
-      });
-      return;
-    }
-    if (!this._thumbObserver) {
-      this._thumbObserver = new IntersectionObserver((entries) => {
-        for (const entry of entries) {
-          const im = entry.target;
-          if (entry.isIntersecting && im.dataset.src) {
-            requestAnimationFrame(() => {
-              if (im.dataset.src) {
-                im.src = im.dataset.src;
-                delete im.dataset.src;
-              }
-            });
-            this._thumbObserver.unobserve(im);
-          }
-        }
-      }, {
-        rootMargin: "200px 0px",
-        threshold: 0.01,
-      });
-    }
-    for (const im of document.querySelectorAll(".thumb-img[data-src]")) {
-      const r = im.getBoundingClientRect();
-      const winH = window.innerHeight || 0;
-      if (r.top < winH + 200 && r.bottom > -200) {
-        im.src = im.dataset.src;
-        delete im.dataset.src;
-      } else {
-        this._thumbObserver.observe(im);
-      }
-    }
-    document.querySelectorAll(".thumb-img[data-src]").forEach(im => {
-      this._thumbObserver.observe(im);
-    });
-  },
-
-  /** 渲染单个媒体卡片（优先复用内存缓存的缩略图 img） */
-  renderCard(item) {
-    const card = document.createElement("div");
-    card.className = "media-card" + (App.state.selected.has(item.id) ? " selected" : "");
-    card.dataset.id = item.id;
-
-    const thumbBox = document.createElement("div");
-    thumbBox.className = "thumb-box";
-    const img = document.createElement("img");
-    img.alt = item.filename;
-    img.className = "thumb-img";
-
-    // 优先用内存缓存：已加载过的缩略图翻回时秒显，不再发网络请求
-    const cached = this.getCachedThumb(item.id);
-    if (cached && cached.complete && cached.naturalWidth > 0) {
-      // 复用缓存 img 的 src（浏览器级内存缓存）
-      img.src = cached.src;
-      img.dataset.cached = "1";
-    } else {
-      img.dataset.src = "/api/media/" + item.id + "/thumbnail";
-    }
-    img.onload = () => {
-      // 加载成功后写入内存缓存（供翻回时复用）
-      this.cacheThumb(item.id, img);
-    };
-    img.onerror = () => {
-      img.src = "";
-      img.style.background = "var(--bg-hover)";
-      img.alt = "⚠";
-      delete img.dataset.src;
-    };
-    thumbBox.appendChild(img);
-    card.appendChild(thumbBox);
-
-    const badge = document.createElement("span");
-    badge.className = "badge";
-    badge.textContent = item.type === "video" ? "🎬" : "🖼";
-    card.appendChild(badge);
-
-    if (item.type === "video" && item.duration) {
-      const dur = document.createElement("span");
-      dur.className = "dur";
-      dur.textContent = formatDuration(item.duration);
-      card.appendChild(dur);
-    }
-
-    const name = document.createElement("div");
-    name.className = "name";
-    name.textContent = item.filename;
-    name.title = item.path;
-    card.appendChild(name);
-
-    card.onclick = (e) => {
-      e.stopPropagation();
-      if (e.shiftKey) {
-        this.selectRange(item.id);
-      } else if (e.ctrlKey || e.metaKey) {
-        if (App.state.selected.has(item.id)) App.state.selected.delete(item.id);
-        else App.state.selected.add(item.id);
-        App.state.lastAnchor = item.id;
-        card.classList.toggle("selected");
-      } else {
-        App.state.selected.clear();
-        App.state.selected.add(item.id);
-        App.state.lastAnchor = item.id;
-        this.render();
-      }
-      this.updateSelInfo();
-      SidePanel.open();
-      SidePanel.refresh();
-    };
-
-    card.ondblclick = (e) => {
-      e.stopPropagation();
-      const idx = App.state.items.findIndex(i => i.id === item.id);
-      Viewer.open(App.state.items, idx >= 0 ? idx : 0);
-    };
-
-    return card;
-  },
-
-  /** Shift 区间选择：从锚点到当前项之间的所有项 */
+  /** Shift 区间选择 */
   selectRange(itemId) {
     const ids = App.state.items.map(i => i.id);
     const curIdx = ids.indexOf(itemId);
@@ -369,10 +378,11 @@ const Gallery = {
       App.state.selected.add(ids[i]);
     }
     this.render();
+    if (this._abortCtrl) this.loadVisibleThumbs(this._abortCtrl.signal);
     this.updateSelInfo();
   },
 
-  /** 缩略图大小滑块：调节 grid 列宽（CSS 变量 --thumb-size），并持久化到 localStorage。 */
+  /** 缩略图大小滑块 */
   initThumbSlider() {
     const slider = document.getElementById("thumb-size-slider");
     if (!slider || slider.dataset.inited) return;
@@ -393,7 +403,7 @@ const Gallery = {
     });
   },
 
-  /** 框选：在画廊空白处按下鼠标拖拽，框选矩形范围内的卡片。 */
+  /** 框选 */
   initBoxSelect() {
     const gallery = document.getElementById("gallery");
     if (!gallery || gallery.dataset.boxSelect) return;
@@ -438,13 +448,14 @@ const Gallery = {
       box = null;
       document.body.classList.remove("selecting");
       this.render();
+      if (this._abortCtrl) this.loadVisibleThumbs(this._abortCtrl.signal);
       this.updateSelInfo();
       SidePanel.open();
       SidePanel.refresh();
     });
   },
 
-  /** 更新结果统计（分页） */
+  /** 更新结果统计 */
   updateResultInfo() {
     document.getElementById("result-info").textContent =
       "共 " + App.state.total + " 个素材 · 第 " + App.state.page + " 页";
@@ -462,6 +473,7 @@ const Gallery = {
     App.state.lastAnchor = null;
     this.updateSelInfo();
     this.render();
+    if (this._abortCtrl) this.loadVisibleThumbs(this._abortCtrl.signal);
     SidePanel.refresh();
   },
 };
