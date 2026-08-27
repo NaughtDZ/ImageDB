@@ -1,7 +1,70 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <!-- 占位图标：蓝底圆角方块 + 白色 "ID" 字样 -->
-  <!-- 替换成你自己的图标：把本文件内容换成你的 SVG 即可（保持 64x64 或任意正方形） -->
-  <rect width="64" height="64" rx="12" fill="#4c8dff"/>
-  <text x="32" y="42" font-family="Segoe UI, Arial, sans-serif" font-size="26"
-        font-weight="bold" fill="#ffffff" text-anchor="middle">ID</text>
+  <!-- ImageDB 图标 v3：二次元大眼 + 相册书架（归档&查看图片/视频） -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2a1a52"/><stop offset="1" stop-color="#12143a"/>
+    </linearGradient>
+    <linearGradient id="iris" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8a63ff"/><stop offset="0.5" stop-color="#4b86ff"/><stop offset="1" stop-color="#2bd0f0"/>
+    </linearGradient>
+    <linearGradient id="b1" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff8fb6"/><stop offset="1" stop-color="#ff5f9e"/>
+    </linearGradient>
+    <linearGradient id="b2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd970"/><stop offset="1" stop-color="#ffb24d"/>
+    </linearGradient>
+    <linearGradient id="b3" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7ee8a8"/><stop offset="1" stop-color="#4cd08f"/>
+    </linearGradient>
+    <linearGradient id="b4" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6fd8ff"/><stop offset="1" stop-color="#3aa8ff"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="64" height="64" rx="15" fill="url(#bg)"/>
+
+  <!-- 装饰星光 -->
+  <circle cx="9" cy="8" r="1.1" fill="#fff" opacity="0.55"/>
+  <circle cx="56" cy="6" r="0.8" fill="#fff" opacity="0.4"/>
+  <circle cx="52" cy="14" r="0.7" fill="#8a63ff" opacity="0.8"/>
+  <circle cx="7" cy="17" r="0.6" fill="#7ee8a8" opacity="0.7"/>
+  <path d="M13 6 l0.9 1.8 1.8 0.9 -1.8 0.9 -0.9 1.8 -0.9 -1.8 -1.8 -0.9 1.8 -0.9 Z" fill="#ffd970" opacity="0.9"/>
+
+  <!-- ===== 大动漫眼睛 ===== -->
+  <g transform="translate(34 25)">
+    <path d="M-20 0 C-19 -10.5 -9.5 -15 0 -15 C9.5 -15 19 -10.5 20 0 C16.5 4.5 9.5 6.5 0 6.5 C-9.5 6.5 -16.5 4.5 -20 0 Z" fill="#0d0a26"/>
+    <path d="M-17.5 0 C-16.5 -8.5 -8.5 -13 0 -13 C8.5 -13 16.5 -8.5 17.5 0 C14 4 8.5 5.5 0 5.5 C-8.5 5.5 -14 4 -17.5 0 Z" fill="#ffffff"/>
+    <path d="M-15 2.5 C-12 4.5 -5 5.5 0 5.5" fill="none" stroke="#0d0a26" stroke-width="1" stroke-linecap="round" opacity="0.5"/>
+    <circle cx="0" cy="0.5" r="9.5" fill="url(#iris)"/>
+    <path d="M-7.5 0.5 A7.5 7.5 0 0 1 7.5 0.5" fill="none" stroke="#1f2a6c" stroke-width="0.8" opacity="0.35"/>
+    <path d="M-6.5 -2 A7.5 7.5 0 0 1 6.5 -2" fill="none" stroke="#1f2a6c" stroke-width="0.5" opacity="0.25"/>
+    <circle cx="0" cy="1" r="5" fill="#150b30"/>
+    <circle cx="-3.8" cy="-3.2" r="3.2" fill="#fff" opacity="0.95"/>
+    <circle cx="-2.1" cy="-4.6" r="1.3" fill="#fff" opacity="0.85"/>
+    <circle cx="3.8" cy="3.2" r="1.7" fill="#fff" opacity="0.5"/>
+  </g>
+
+  <!-- ===== 相册书架（书脊上有小照片/播放标记） ===== -->
+  <g transform="translate(0 47)">
+    <rect x="6" y="13" width="52" height="4" rx="2" fill="#332c64"/>
+    <!-- 彩色书脊相册 -->
+    <g>
+      <rect x="9" y="2" width="5.5" height="11" rx="1.2" fill="url(#b1)"/>
+      <!-- 书脊上的小相片图标（白框山景） -->
+      <rect x="10.5" y="4" width="2.5" height="2.5" rx="0.5" fill="#fff" opacity="0.9"/>
+      <rect x="15" y="4" width="5.5" height="9" rx="1.2" fill="url(#b2)"/>
+      <!-- 播放键（视频） -->
+      <path d="M17.2 5.5 l2.2 1.5 -2.2 1.5 Z" fill="#fff" opacity="0.9"/>
+      <rect x="21" y="1" width="5.5" height="12" rx="1.2" fill="url(#b3)"/>
+      <rect x="22.5" y="3.5" width="2.5" height="2.5" rx="0.5" fill="#fff" opacity="0.9"/>
+      <rect x="27" y="3" width="5.5" height="10" rx="1.2" fill="url(#b4)"/>
+      <path d="M29.2 5.5 l2.2 1.5 -2.2 1.5 Z" fill="#fff" opacity="0.9"/>
+      <rect x="33" y="2" width="5.5" height="11" rx="1.2" fill="url(#b1)"/>
+      <rect x="34.5" y="4" width="2.5" height="2.5" rx="0.5" fill="#fff" opacity="0.9"/>
+      <rect x="39" y="5" width="5.5" height="8" rx="1.2" fill="url(#b2)"/>
+      <path d="M41.2 7 l2.2 1.5 -2.2 1.5 Z" fill="#fff" opacity="0.9"/>
+      <rect x="45" y="1" width="5.5" height="12" rx="1.2" fill="url(#b3)"/>
+      <rect x="46.5" y="3.5" width="2.5" height="2.5" rx="0.5" fill="#fff" opacity="0.9"/>
+    </g>
+  </g>
 </svg>
