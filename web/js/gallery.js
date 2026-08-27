@@ -1,21 +1,51 @@
 /* ============================================================
- * 画廊组件：媒体网格、选择（单击/Ctrl/Shift/框选）、分页浏览、缩略图预取
+ * 画廊组件：媒体网格、选择（单击/Ctrl/Shift/框选）、分页浏览、缩略图内存缓存
  *
- * 分页模式（替代"加载更多"）：
- *   - 每次只显示一页，翻页时丢弃旧页内容节省内存；
+ * 缩略图缓存策略（解决高强度翻页卡顿）：
+ *   - 内存缓存：Gallery._thumbCache (Map<mediaId, img>) 记录已成功加载的缩略图，
+ *     翻回已访问页时直接复用缓存的 <img>，秒显不再重新网络请求；
+ *     采用 LRU 策略，上限 _THUMB_CACHE_MAX 张（默认 400）防止内存无限增长。
+ *   - 硬盘持久化：缩略图生成后仍持久化到 data/thumbs/（重启共用，生成过就保留）。
+ *   - 预取：翻页后只预取"视口内 + 少量余量"的缩略图（而非整页 60 张），
+ *     避免首访新页时瞬间生成大量缩略图导致卡顿。
+ *   - 浏览状态：关闭/退出时保存当前目录、页码、滚动位置到 localStorage，
+ *     下次启动自动恢复。
+ *
+ * 分页模式：
+ *   - 每次只显示一页，翻页丢弃旧页内容省内存；
  *   - 每页数量可设置（工具栏输入框，记忆上次值）；
- *   - 翻页后滚动回顶部、清空选择；
- *   - 翻页后预取当前页缩略图，滚动更顺滑。
- *
- * 选择交互：
- *   单击        选中单项（清空其他）
- *   Ctrl/⌘+单击 切换单项
- *   Shift+单击   区间选择（从锚点到当前项，可连续 Shift 扩展）
- *   空白处拖拽   框选（矩形范围内的所有卡片）
- *   空白处单击   清空选择
+ *   - 翻页后滚动回顶部、清空选择。
  * ============================================================ */
 const Gallery = {
-  /** 加载媒体列表：分页模式，翻页时丢弃旧页内容以节省内存 */
+  // 内存缩略图缓存：mediaId -> <img>（已加载）
+  _thumbCache: new Map(),
+  _THUMB_CACHE_MAX: 400,   // 内存缓存上限（张），超过按 LRU 淘汰最旧的
+
+  /** 缓存一张已加载的缩略图（LRU） */
+  cacheThumb(id, imgEl) {
+    // 已存在则先删（重新插到队尾表示最近使用）
+    if (this._thumbCache.has(id)) {
+      this._thumbCache.delete(id);
+    }
+    this._thumbCache.set(id, imgEl);
+    // 超限淘汰最旧的（Map 迭代序 = 插入序，第一个最旧）
+    while (this._thumbCache.size > this._THUMB_CACHE_MAX) {
+      const oldestKey = this._thumbCache.keys().next().value;
+      this._thumbCache.delete(oldestKey);
+    }
+  },
+
+  /** 从内存缓存取缩略图（命中则返回 img 并标记最近使用） */
+  getCachedThumb(id) {
+    if (!this._thumbCache.has(id)) return null;
+    const img = this._thumbCache.get(id);
+    // 命中：移到队尾（LRU 更新）
+    this._thumbCache.delete(id);
+    this._thumbCache.set(id, img);
+    return img;
+  },
+
+  /** 加载媒体列表：分页模式，翻页丢弃旧页内容省内存 */
   async load(reset) {
     const f = App.state.filters;
     const params = new URLSearchParams();
@@ -36,11 +66,12 @@ const Gallery = {
       App.state.selected.clear();
       App.state.lastAnchor = null;
       this.render();
-      this.prefetchCurrentPage();   // 预取当前页缩略图
+      this.prefetchVisible();   // 只预取视口附近的缩略图
       this.updatePager();
       this.updateResultInfo();
       this.updateSelInfo();
       this.scrollTop();
+      this.saveBrowseState();   // 记录当前浏览状态
     } catch (e) {
       if (e.status === 410) {
         toast("部分文件已被外部删除，记录已自动清理", "err");
@@ -59,23 +90,48 @@ const Gallery = {
   },
 
   /**
-   * 预取当前页缩略图：提前请求当前页的缩略图，触发后端生成并写入磁盘缓存。
-   * 这样用户滚动浏览时缩略图已就绪（避免每张现生成导致的卡顿）。
-   * 分批执行（每批 8 张、间隔 60ms），避免瞬间大量请求阻塞主线程。
+   * 只预取"视口内 + 少量余量"的缩略图（而非整页）。
+   * 翻页后主要看视口内容，预取太多首访新页会导致瞬间生成大量缩略图卡顿。
    */
-  prefetchCurrentPage() {
+  prefetchVisible() {
     const items = App.state.items || [];
     if (!items.length) return;
-    const urls = items.map(i => "/api/media/" + i.id + "/thumbnail");
+    const galleryEl = document.getElementById("gallery");
+    const winH = window.innerHeight || 0;
+    // 预估视口能容纳的行数（每行约 6 列 + 余量）
+    const visibleCount = Math.ceil((winH / 190) * 6) + 12;
+    const urls = items.slice(0, visibleCount).map(i => "/api/media/" + i.id + "/thumbnail");
     let idx = 0;
     const batch = () => {
-      for (let n = 0; n < 8 && idx < urls.length; n++, idx++) {
+      for (let n = 0; n < 6 && idx < urls.length; n++, idx++) {
         const im = new Image();
-        im.src = urls[idx];   // 触发浏览器请求 → 后端生成缩略图并缓存
+        im.src = urls[idx];   // 触发后端生成并写硬盘缓存 + 浏览器缓存
       }
-      if (idx < urls.length) setTimeout(batch, 60);
+      if (idx < urls.length) setTimeout(batch, 50);
     };
-    setTimeout(batch, 120);
+    setTimeout(batch, 100);
+  },
+
+  /** 保存当前浏览状态到 localStorage（目录、页码、滚动位置） */
+  saveBrowseState() {
+    try {
+      localStorage.setItem("imagedb_browse", JSON.stringify({
+        folderId: App.state.currentFolderId,
+        page: App.state.page,
+        pageSize: App.state.pageSize,
+        scrollTop: document.getElementById("gallery")?.scrollTop || 0,
+        ts: Date.now(),
+      }));
+    } catch (e) { /* localStorage 满或不可用，忽略 */ }
+  },
+
+  /** 读取上次保存的浏览状态（用于启动恢复） */
+  loadBrowseState() {
+    try {
+      const raw = localStorage.getItem("imagedb_browse");
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch (e) { return null; }
   },
 
   /** 翻页到指定页码 */
@@ -176,7 +232,7 @@ const Gallery = {
     }, 1500);
   },
 
-  /** 按需渲染：IntersectionObserver 只加载视口内缩略图 */
+  /** 按需渲染：IntersectionObserver 只加载视口内缩略图（优先复用内存缓存） */
   observeThumbs() {
     const galleryEl = document.getElementById("gallery");
     if (!galleryEl || !("IntersectionObserver" in window)) {
@@ -220,7 +276,7 @@ const Gallery = {
     });
   },
 
-  /** 渲染单个媒体卡片 */
+  /** 渲染单个媒体卡片（优先复用内存缓存的缩略图 img） */
   renderCard(item) {
     const card = document.createElement("div");
     card.className = "media-card" + (App.state.selected.has(item.id) ? " selected" : "");
@@ -231,11 +287,25 @@ const Gallery = {
     const img = document.createElement("img");
     img.alt = item.filename;
     img.className = "thumb-img";
-    img.dataset.src = "/api/media/" + item.id + "/thumbnail";
+
+    // 优先用内存缓存：已加载过的缩略图翻回时秒显，不再发网络请求
+    const cached = this.getCachedThumb(item.id);
+    if (cached && cached.complete && cached.naturalWidth > 0) {
+      // 复用缓存 img 的 src（浏览器级内存缓存）
+      img.src = cached.src;
+      img.dataset.cached = "1";
+    } else {
+      img.dataset.src = "/api/media/" + item.id + "/thumbnail";
+    }
+    img.onload = () => {
+      // 加载成功后写入内存缓存（供翻回时复用）
+      this.cacheThumb(item.id, img);
+    };
     img.onerror = () => {
       img.src = "";
       img.style.background = "var(--bg-hover)";
       img.alt = "⚠";
+      delete img.dataset.src;
     };
     thumbBox.appendChild(img);
     card.appendChild(thumbBox);

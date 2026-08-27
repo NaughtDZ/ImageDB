@@ -377,14 +377,32 @@ def verify_all() -> dict:
     """
     全库校验：遍历所有根目录，磁盘上不存在的目录/文件自动从数据库删除。
     由后台校验线程与“手动校验”按钮调用。
+    所有删除路径都会同步清理缩略图缓存文件（避免幽灵缩略图堆积）。
     返回清理统计。
     """
     removed_folders = 0
     removed_media = 0
+
+    def _collect_media_ids(folder_id):
+        """收集子树下所有媒体 id。"""
+        return [r["id"] for r in query_all(
+            """WITH RECURSIVE sub(id) AS (
+                   SELECT id FROM folders WHERE id = ?
+                   UNION ALL
+                   SELECT f.id FROM folders f JOIN sub s ON f.parent_id = s.id
+               )
+               SELECT m.id FROM media_items m JOIN sub s ON m.folder_id = s.id""",
+            (folder_id,))]
+
     roots = query_all("SELECT id, path FROM folders WHERE is_root = 1")
     for root in roots:
         if not os.path.isdir(root["path"]):
-            # 根目录不存在：删除整棵子树
+            # 根目录不存在：先清缩略图，再删整棵子树
+            try:
+                from . import media as media_service
+                media_service.delete_thumbnails(_collect_media_ids(root["id"]))
+            except Exception:  # noqa: BLE001
+                pass
             n = _count_media_in(_subtree_folder_ids(root["id"]))
             delete("DELETE FROM folders WHERE id = ?", (root["id"],))
             removed_folders += 1
@@ -396,6 +414,12 @@ def verify_all() -> dict:
             if not frow:
                 continue
             if not os.path.isdir(frow["path"]):
+                # 子目录不存在：清缩略图，再删除该子树
+                try:
+                    from . import media as media_service
+                    media_service.delete_thumbnails(_collect_media_ids(f))
+                except Exception:  # noqa: BLE001
+                    pass
                 n = _count_media_in(_subtree_folder_ids(f))
                 delete("DELETE FROM folders WHERE id = ?", (f,))
                 removed_folders += 1
@@ -408,14 +432,13 @@ def verify_all() -> dict:
                 continue
             for item in query_all("SELECT id, filename FROM media_items WHERE folder_id = ?", (f,)):
                 if item["filename"] not in on_disk:
+                    try:
+                        from . import media as media_service
+                        media_service.delete_thumbnails([item["id"]])
+                    except Exception:  # noqa: BLE001
+                        pass
                     delete("DELETE FROM media_items WHERE id = ?", (item["id"],))
                     removed_media += 1
-
-    if removed_folders or removed_media:
-        logger.info("校验完成：清理缺失目录 %d 个，缺失媒体 %d 个", removed_folders, removed_media)
-    return {"removed_folders": removed_folders, "removed_media": removed_media}
-
-
 def check_folder(folder_id: int) -> dict:
     """
     校验单个目录（用户点击树节点时调用）：
@@ -434,16 +457,35 @@ def check_folder(folder_id: int) -> dict:
 
 def remove_folder(folder_id: int) -> int:
     """
-    把目录（含子树）从库中移除（不删除磁盘文件）。
+    把目录（含子树）从库中移除（不删除磁盘文件，但清理缩略图缓存文件）。
     返回被移除的媒体数量。
     """
     n = _count_media_in(_subtree_folder_ids(folder_id))
+    try:
+        from . import media as media_service
+        rows = query_all(
+            """WITH RECURSIVE sub(id) AS (
+                   SELECT id FROM folders WHERE id = ?
+                   UNION ALL
+                   SELECT f.id FROM folders f JOIN sub s ON f.parent_id = s.id
+               )
+               SELECT m.id FROM media_items m JOIN sub s ON m.folder_id = s.id""",
+            (folder_id,),
+        )
+        media_service.delete_thumbnails([r["id"] for r in rows])
+    except Exception:  # noqa: BLE001
+        pass
     delete("DELETE FROM folders WHERE id = ?", (folder_id,))
     return n
 
 
 def remove_media_item(media_id: int) -> bool:
-    """从库中删除单个媒体记录（文件被外部删除时调用）。"""
+    """从库中删除单个媒体记录（文件被外部删除时调用），并同步清理缩略图文件。"""
+    try:
+        from . import media as media_service
+        media_service.delete_thumbnails([media_id])
+    except Exception:  # noqa: BLE001
+        pass
     return delete("DELETE FROM media_items WHERE id = ?", (media_id,)) > 0
 
 

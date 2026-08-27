@@ -246,6 +246,29 @@ def thumb_cache_size() -> int:
     return total
 
 
+def delete_thumbnails(media_ids) -> int:
+    """
+    批量删除缩略图文件（不删除媒体记录，只清理磁盘上的缩略图缓存文件）。
+    用于：用户从库中删除媒体、目录被移除、文件被外部删除（缺失校验）时，
+    同步清理对应的 data/thumbs/*.jpg，避免"幽灵缩略图"堆积。
+    返回删除的文件数。
+    """
+    if not media_ids:
+        return 0
+    removed = 0
+    for mid in media_ids:
+        try:
+            p = os.path.join(_thumb_dir(), f"{int(mid)}.jpg")
+            if os.path.isfile(p):
+                os.remove(p)
+                removed += 1
+        except (OSError, ValueError, TypeError):
+            continue
+    if removed:
+        logger.info("清理缩略图文件 %d 个", removed)
+    return removed
+
+
 def get_thumbnail_path(media_id: int) -> str | None:
     """读取数据库中记录的缩略图相对路径。"""
     row = query_one("SELECT thumbnail FROM media_items WHERE id = ?", (media_id,))
