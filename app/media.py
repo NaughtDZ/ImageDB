@@ -178,6 +178,74 @@ def cleanup_frames(paths: list[str]) -> None:
             pass
 
 
+def cleanup_thumb_cache(limit_mb: int) -> tuple[int, int]:
+    """
+    清理缩略图磁盘缓存（LRU：按 mtime 从旧到新删除）。
+    当 data/thumbs/ 总大小超过 limit_mb 时，删除最旧的缩略图文件直到达标。
+    limit_mb <= 0 表示不限制（不清理）。
+    返回 (删除的文件数, 释放的字节数)。
+    调用时机：访问缩略图后由 server 触发（低频即可，避免频繁扫描）。
+    """
+    if limit_mb <= 0:
+        return 0, 0  # 0 或负数 = 不限制，不清理
+
+    thumb_dir = _thumb_dir()
+    try:
+        entries = [e for e in os.scandir(thumb_dir)
+                   if e.is_file() and e.name.endswith(".jpg")]
+    except OSError:
+        return 0, 0
+    if not entries:
+        return 0, 0
+
+    # 统计当前总大小
+    total = 0
+    for e in entries:
+        try:
+            total += e.stat().st_size
+        except OSError:
+            continue
+    limit_bytes = limit_mb * 1024 * 1024
+    if total <= limit_bytes:
+        return 0, 0
+
+    # 按 mtime 升序（最旧在前）排序
+    entries.sort(key=lambda e: e.stat().st_mtime)
+
+    removed = 0
+    freed = 0
+    for e in entries:
+        if total <= limit_bytes:
+            break
+        try:
+            size = e.stat().st_size
+            os.remove(e.path)
+            total -= size
+            removed += 1
+            freed += size
+        except OSError:
+            continue
+    if removed:
+        logger.info("缩略图缓存清理：删除 %d 个，释放 %.1f MB", removed, freed / 1024 / 1024)
+    return removed, freed
+
+
+def thumb_cache_size() -> int:
+    """返回缩略图缓存当前总大小（字节）。"""
+    thumb_dir = _thumb_dir()
+    total = 0
+    try:
+        for e in os.scandir(thumb_dir):
+            if e.is_file() and e.name.endswith(".jpg"):
+                try:
+                    total += e.stat().st_size
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return total
+
+
 def get_thumbnail_path(media_id: int) -> str | None:
     """读取数据库中记录的缩略图相对路径。"""
     row = query_one("SELECT thumbnail FROM media_items WHERE id = ?", (media_id,))

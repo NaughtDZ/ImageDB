@@ -75,6 +75,7 @@ const Settings = {
     document.getElementById("set-video-maxframes").value = s.video_max_frames || "20";
     document.getElementById("set-video-thumbsec").value = s.video_thumb_frame_sec || "1";
     document.getElementById("set-thumb-size").value = s.thumb_size || "320";
+    document.getElementById("set-thumb-cache-limit").value = s.thumb_cache_limit_mb || "200";
     document.getElementById("set-verify-interval").value = s.verify_interval_sec || "60";
   },
 
@@ -172,6 +173,7 @@ const Settings = {
     s.video_max_frames = document.getElementById("set-video-maxframes").value;
     s.video_thumb_frame_sec = document.getElementById("set-video-thumbsec").value;
     s.thumb_size = document.getElementById("set-thumb-size").value;
+    s.thumb_cache_limit_mb = document.getElementById("set-thumb-cache-limit").value;
     s.verify_interval_sec = document.getElementById("set-verify-interval").value;
     // HuggingFace 令牌
     s.hf_token = document.getElementById("dl-hf-token").value.trim();

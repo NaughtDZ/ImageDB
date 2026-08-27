@@ -72,6 +72,11 @@
           <input type="range" id="thumb-size-slider" min="100" max="400" value="160">
           <span class="icon" style="font-size:16px">🔎</span>
         </span>
+        <span class="page-size" title="每页显示数量（翻页时丢弃旧页缩略图以节省内存）">
+          <label>每页</label>
+          <input type="number" id="page-size-input" min="10" max="500" step="10" value="60" style="width:56px">
+          <span>张</span>
+        </span>
         <select id="sort-select">
           <option value="name">按名称</option>
           <option value="date">按入库时间</option>
@@ -86,8 +91,14 @@
       </div>
     </div>
     <div id="gallery" class="gallery"></div>
-    <div id="loadmore-wrap">
-      <button id="btn-loadmore" class="btn" style="display:none">加载更多</button>
+    <div id="loadmore-wrap" class="pager-wrap">
+      <button id="btn-page-first" class="btn" title="第一页">⏮ 首页</button>
+      <button id="btn-page-prev" class="btn" title="上一页">◀ 上一页</button>
+      <span class="pager-info">第 <span id="pager-current">1</span> / <span id="pager-total">1</span> 页</span>
+      <input type="number" id="pager-goto" min="1" value="1" style="width:56px" title="跳转到第几页">
+      <button id="btn-page-goto" class="btn">跳转</button>
+      <button id="btn-page-next" class="btn" title="下一页">下一页 ▶</button>
+      <button id="btn-page-last" class="btn" title="最后一页">末页 ⏭</button>
     </div>
   </section>
 
@@ -249,6 +260,11 @@
           <input id="set-video-thumbsec" type="number" min="0" step="0.1" value="1"></div>
         <div class="form-row"><label>缩略图尺寸（像素）</label>
           <input id="set-thumb-size" type="number" min="64" value="320"></div>
+          <div class="form-row"><label>缩略图缓存上限（MB）</label>
+            <input id="set-thumb-cache-limit" type="number" min="0" step="50" value="200"></div>
+          <div class="hint">0 = 不限制；超限时自动清理最久未访问的缩略图（LRU）。
+            默认 200MB ≈ 数千张缩略图，比 1GB 更合理。首次点击素材时生成缩略图，
+            生成过就保留，翻回已访问页会从缓存快速读取。</div>
         <div class="form-row"><label>后台缺失校验间隔（秒，0=关闭）</label>
           <input id="set-verify-interval" type="number" min="0" value="60"></div>
       </div>

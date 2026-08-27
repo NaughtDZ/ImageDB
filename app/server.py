@@ -308,6 +308,26 @@ def search_media(folder_id: Optional[int] = None, q: str = "", dir_q: str = "",
     return {"total": total, "page": page, "page_size": page_size, "items": items}
 
 
+def _maybe_cleanup_thumbs() -> None:
+    """低频触发缩略图缓存清理（每次访问时调用，但内部节流避免频繁扫描）。
+    仅在缓存明显超限时才真正扫描清理。"""
+    try:
+        limit = AppConfig().get_int("thumb_cache_limit_mb", 200)
+        if limit <= 0:
+            return  # 0 = 不限制
+        # 粗筛：定期（每 60 次访问）检查一次总大小
+        global _thumb_clean_counter
+        _thumb_clean_counter += 1
+        if _thumb_clean_counter % 60 != 0:
+            return
+        media_service.cleanup_thumb_cache(limit)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_thumb_clean_counter = 0
+
+
 def _require_media(mid: int, auto_clean: bool = True) -> dict:
     """
     查询媒体记录；若文件已被外部删除：
@@ -503,6 +523,11 @@ def create_app(config: AppConfig) -> FastAPI:
         if row["thumbnail"] and not regenerate:
             abs_path = os.path.join(DATA_DIR, row["thumbnail"])
             if os.path.isfile(abs_path):
+                try:
+                    os.utime(abs_path, None)
+                except OSError:
+                    pass
+                _maybe_cleanup_thumbs()
                 return FileResponse(abs_path)
         cfg = config
         media_service.make_thumbnail(

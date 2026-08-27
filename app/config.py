@@ -37,6 +37,7 @@ DEFAULTS: dict[str, str] = {
     "video_max_frames": "20",           # 视频打标最多抽帧数（0 = 不限制）
     "video_thumb_frame_sec": "1.0",     # 视频缩略图取帧位置（秒）
     "thumb_size": "320",                # 缩略图最长边像素
+    "thumb_cache_limit_mb": "200",      # 缩略图磁盘缓存上限（MB），超限自动清理最旧的（LRU）
     "tagging_parallel": "4",            # 并行打标量：每次批量推理的图片数（GPU 并行度）
     # ---- 打标工具参数（JSON 字符串，每个工具一个配置块）----
     "tool_cl_tagger": json.dumps({

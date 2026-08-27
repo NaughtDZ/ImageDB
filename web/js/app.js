@@ -31,6 +31,8 @@ const App = {
     Settings.init();
     // 初始化画廊框选
     Gallery.initBoxSelect();
+    // 初始化分页导航
+    Gallery.initPager();
     // 初始化缩略图大小滑块
     Gallery.initThumbSlider();
     // 初始化右侧标签侧边栏
