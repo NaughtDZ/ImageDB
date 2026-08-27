@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- 占位图标：蓝底圆角方块 + 白色 "ID" 字样 -->
+  <!-- 替换成你自己的图标：把本文件内容换成你的 SVG 即可（保持 64x64 或任意正方形） -->
+  <rect width="64" height="64" rx="12" fill="#4c8dff"/>
+  <text x="32" y="42" font-family="Segoe UI, Arial, sans-serif" font-size="26"
+        font-weight="bold" fill="#ffffff" text-anchor="middle">ID</text>
+</svg>
