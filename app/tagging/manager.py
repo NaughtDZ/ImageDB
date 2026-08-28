@@ -150,6 +150,28 @@ class PluginManager:
             self._finish_job(job_id, "failed", "没有可打标的媒体文件")
             return
 
+        # 优化：不覆盖时，跳过已用该工具打标过的媒体（只推理新增/未打标的）。
+        # 例如目录几千张已打标、新加几十张，右键整目录打标时只处理新增的。
+        if not overwrite:
+            try:
+                ph = ",".join("?" * len(target_ids))
+                done_rows = query_all(
+                    f"SELECT DISTINCT media_id FROM media_tags"
+                    f" WHERE media_id IN ({ph}) AND source = ?",
+                    target_ids + [tool],
+                )
+                done_ids = {r["media_id"] for r in done_rows}
+                if done_ids:
+                    already = len(done_ids)
+                    target_ids = [mid for mid in target_ids if mid not in done_ids]
+                    logger.info("[%s] 跳过 %d 个已打标媒体，剩余 %d 个待打标", tool, already, len(target_ids))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("跳过已打标媒体失败（改为全部处理）：%s", exc)
+        
+        if not target_ids:
+            self._finish_job(job_id, "done", "所有目标媒体都已用该工具打标过，无需重复打标")
+            return
+        
         total = len(target_ids)
         execute("UPDATE tag_jobs SET status='running', total=? WHERE id=?", (total, job_id))
 
