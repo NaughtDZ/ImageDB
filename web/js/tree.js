@@ -158,6 +158,15 @@ const TreeView = {
       menu.appendChild(d);
     }
     document.body.appendChild(menu);
+    // 防溢出：菜单默认显示在光标右下角；若目录贴在浏览器底边/右边，菜单会超出视口被截断。
+    // 这里在渲染后测量菜单实际尺寸，若右/底边缘超出视口，则向左/上平移，保证完整露出。
+    const _vw = window.innerWidth, _vh = window.innerHeight;
+    const _mw = menu.offsetWidth, _mh = menu.offsetHeight;
+    let _x = e.clientX, _y = e.clientY;
+    if (_x + _mw > _vw) _x = Math.max(4, _vw - _mw);   // 右边溢出 → 左移
+    if (_y + _mh > _vh) _y = Math.max(4, _vh - _mh);   // 底边溢出 → 上移
+    menu.style.left = _x + "px";
+    menu.style.top = _y + "px";
     // 点击其他位置时由 app.js 的全局监听移除
   },
 
