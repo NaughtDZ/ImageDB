@@ -259,7 +259,7 @@ class OnnxTaggerPlugin(TaggerPlugin):
             return None
         # 标签文件（优先 JSON 映射，其次 txt / csv）
         tags_path = None
-        for cand in ("tag_mapping.json", "tags.json", "tags.txt", "selected_tags.csv"):
+        for cand in ("tag_mapping.json", "tags.json", "model_vocabulary.json", "tags.txt", "selected_tags.csv"):
             p = os.path.join(model_dir, cand)
             if os.path.isfile(p):
                 tags_path = p
@@ -286,8 +286,13 @@ class OnnxTaggerPlugin(TaggerPlugin):
             return False
         onnx_path, tags_path = found
 
-        # 读取标签文件（JSON 映射 / CSV / 纯文本三种格式）
-        if tags_path.endswith(".json"):
+        # 读取标签文件（JSON 映射 / 词汇表 / CSV / 纯文本）
+        if "model_vocabulary" in tags_path:
+            # v2 模型：用 model_vocabulary.json 加载标签
+            if not self._load_vocabulary_json(tags_path):
+                return False
+        elif tags_path.endswith(".json"):
+            # v1 / cl_tagger：JSON 映射（idx_to_tag + tag_to_category）
             if not self._load_tag_mapping_json(tags_path):
                 return False
         elif tags_path.endswith(".csv"):
@@ -318,11 +323,18 @@ class OnnxTaggerPlugin(TaggerPlugin):
         except Exception as exc:  # noqa: BLE001
             self.set_error(f"加载 ONNX 模型失败：{exc}")
             return False
-        # 检查模型输入维度，与配置的 input_size 比对，给出诊断提示
+        # 输入尺寸自适应：读模型声明的真实 shape，覆盖配置的 input_size
+        # （cl_tagger v2 等模型输入尺寸可能与 v1 不同，如 384/448，必须按模型实际尺寸预处理）
         try:
             inp_shape = self.session.get_inputs()[0].shape
-            logger.info("[%s] 模型输入声明: %s，当前配置 input_size=%s",
-                        self.name, inp_shape, self.config.get("input_size"))
+            if (len(inp_shape) == 4 and isinstance(inp_shape[2], int)
+                    and isinstance(inp_shape[3], int) and inp_shape[2] == inp_shape[3]):
+                self.config["input_size"] = inp_shape[2]
+                logger.info("[%s] 模型输入尺寸自适应: %s（覆盖为 %d）",
+                            self.name, inp_shape, inp_shape[2])
+            else:
+                logger.info("[%s] 模型输入声明: %s（非静态方形，跳过自适应）",
+                            self.name, inp_shape)
         except Exception:  # noqa: BLE001
             pass
         self._loaded = True
@@ -338,6 +350,34 @@ class OnnxTaggerPlugin(TaggerPlugin):
     def unload(self) -> None:
         self.session = None
         super().unload()
+
+    def _load_vocabulary_json(self, path: str) -> bool:
+        """解析 v2 的 model_vocabulary.json（标签词汇表）。
+        可能是 {"0": "tag", ...}、{"idx_to_tag": {...}} 或 {"tags": [...]} 等格式。
+        """
+        import json
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as exc:
+            self.set_error(f"读取 v2 词汇表失败：{exc}")
+            return False
+        if isinstance(data, dict):
+            if "idx_to_tag" in data:
+                data = data["idx_to_tag"]
+            elif "tags" in data and isinstance(data["tags"], list):
+                data = {str(i): t for i, t in enumerate(data["tags"])}
+        elif isinstance(data, list):
+            data = {str(i): t for i, t in enumerate(data)}
+        else:
+            self.set_error("v2 词汇表格式不支持")
+            return False
+        self.tag_names = [str(v) for v in data.values()] if isinstance(data, dict) else []
+        self.tag_categories = ["" for _ in self.tag_names]
+        if not self.tag_names:
+            self.set_error("v2 词汇表为空")
+            return False
+        return True
 
     def _load_tag_mapping_json(self, path: str) -> bool:
         """

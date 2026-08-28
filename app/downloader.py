@@ -102,6 +102,7 @@ def make_session(proxy_cfg: dict | None, token: str | None = None) -> requests.S
     proxies = build_proxies(proxy_cfg)
     if proxies:
         s.proxies.update(proxies)
+        s.verify = False   # 代理环境：跳过 SSL 证书校验
     s.headers.update({"User-Agent": "ImageDB/1.0"})
     if token:
         # HuggingFace 使用 Bearer 认证；自动补全 Bearer 前缀
@@ -119,6 +120,7 @@ def test_proxy(proxy_cfg: dict | None, timeout: int = 10) -> dict:
         resp = requests.get(
             "https://huggingface.co",
             proxies=proxies or None,
+            verify=not bool(proxies),   # 代理时跳过 SSL 校验
             timeout=timeout,
             headers={"User-Agent": "ImageDB/1.0"},
         )
