@@ -72,6 +72,8 @@ const App = {
     document.getElementById("btn-manual-tags").onclick = () => TagsEditor.open();
     document.getElementById("btn-clear-sel").onclick = () => Gallery.clearSelection();
     document.getElementById("btn-delete-sel").onclick = () => this.deleteSelected();
+    document.getElementById("btn-trash-sel").onclick = () => this.trashSelected();
+    document.getElementById("btn-move-sel").onclick = () => this.moveSelected();
 
     document.getElementById("sort-select").onchange = () => Gallery.load(true);
 
@@ -197,6 +199,69 @@ const App = {
       SidePanel.refresh();
     } catch (e) {
       toast("删除失败：" + e.message, "err");
+    }
+  },
+
+  /** 把选中的素材移到回收站（需输入 yes 确认；无回收站系统需输入两次 yes） */
+  async trashSelected() {
+    const sel = [...this.state.selected];
+    if (sel.length === 0) { toast("请先选择要移到回收站的素材", "err"); return; }
+    const ok = await promptDialog({
+      title: "移到回收站",
+      message: "将把 " + sel.length + " 个素材的文件移到回收站（可从回收站还原），并删除数据库记录。输入 yes 确认：",
+      placeholder: "yes",
+    });
+    if (ok !== "yes") return;
+    try {
+      const res = await API.post("/api/media/trash", { media_ids: sel });
+      if (res.fallback) {
+        // 无回收站系统：需输入第二次 yes 确认彻底删除
+        const ok2 = await promptDialog({
+          title: "系统无回收站，确认彻底删除",
+          message: "当前系统不支持回收站！这些文件将被彻底删除且不可还原。再输入一次 yes 确认：（这是第二次确认）",
+          placeholder: "yes",
+        });
+        if (ok2 !== "yes") { toast("已取消（文件保留在暂存区）", "err"); return; }
+      }
+      toast(res.message || "已移到回收站", "ok");
+      this.state.selected.clear();
+      this.state.lastAnchor = null;
+      await Gallery.load(true);
+      await TreeView.refresh();
+      SidePanel.refresh();
+    } catch (e) {
+      toast("操作失败：" + e.message, "err");
+    }
+  },
+
+  /** 把选中的素材移动到指定目录（需输入 yes 确认） */
+  async moveSelected() {
+    const sel = [...this.state.selected];
+    if (sel.length === 0) { toast("请先选择要移动的素材", "err"); return; }
+    // 先选目标目录
+    const dest = await promptDialog({
+      title: "移动到目录",
+      message: "输入目标目录的绝对路径（必须是已导入的目录）：",
+      placeholder: "例如 D:\\Pictures\\收藏",
+      okText: "下一步",
+    });
+    if (!dest) return;
+    const ok = await promptDialog({
+      title: "确认移动",
+      message: "将把 " + sel.length + " 个素材移动到 " + dest + "，并更新数据库记录。输入 yes 确认：",
+      placeholder: "yes",
+    });
+    if (ok !== "yes") return;
+    try {
+      const res = await API.post("/api/media/move", { media_ids: sel, dest_dir: dest });
+      toast("已移动 " + res.moved + " 个素材", "ok");
+      this.state.selected.clear();
+      this.state.lastAnchor = null;
+      await Gallery.load(true);
+      await TreeView.refresh();
+      SidePanel.refresh();
+    } catch (e) {
+      toast("移动失败：" + e.message, "err");
     }
   },
 

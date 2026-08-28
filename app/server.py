@@ -36,6 +36,7 @@ API 概览：
 from __future__ import annotations
 
 import json
+import shutil
 import logging
 import os
 import threading
@@ -109,6 +110,17 @@ class TagDeleteRequest(BaseModel):
 class MediaDeleteRequest(BaseModel):
     """从数据库删除媒体记录（不删除磁盘文件）。"""
     media_ids: list[int]
+
+
+class MediaTrashRequest(BaseModel):
+    """把媒体文件移到回收站（无回收站系统则彻底删除需二次确认）。"""
+    media_ids: list[int]
+
+
+class MediaMoveRequest(BaseModel):
+    """把媒体文件移动到指定目录。"""
+    media_ids: list[int]
+    dest_dir: str
 
 
 class MediaAddRequest(BaseModel):
@@ -481,6 +493,85 @@ def create_app(config: AppConfig) -> FastAPI:
         removed = execute_rowcount(
             f"DELETE FROM media_items WHERE id IN ({ph})", req.media_ids)
         return {"removed": removed}
+
+    @app.post("/api/media/trash")
+    def api_media_trash(req: MediaTrashRequest) -> dict:
+        """把选中的媒体文件移到回收站（Windows/macOS 用 send2trash），并删除数据库记录。
+        若系统不支持回收站（极端情况），移到 data/trash_pending/ 暂存，标记 fallback=True，
+        前端会要求用户输入两次 yes 才真正处理。绝不直接彻底删除磁盘文件。"""
+        if not req.media_ids:
+            raise HTTPException(400, "未指定媒体")
+        try:
+            from send2trash import send2trash
+            has_trash = True
+        except ImportError:
+            has_trash = False
+            send2trash = None
+        ph = ",".join("?" * len(req.media_ids))
+        rows = query_all(f"SELECT id, path FROM media_items WHERE id IN ({ph})", req.media_ids)
+        moved = 0
+        fallback = False
+        for r in rows:
+            media_service.delete_thumbnails([r["id"]])   # 清理缩略图缓存
+            try:
+                if os.path.exists(r["path"]):
+                    if has_trash:
+                        send2trash(r["path"])   # 移到回收站
+                    else:
+                        # 无回收站：移到暂存目录（不彻底删除），要求二次确认
+                        pending = os.path.join(DATA_DIR, "trash_pending")
+                        os.makedirs(pending, exist_ok=True)
+                        dest = os.path.join(pending, f"{r['id']}_{os.path.basename(r['path'])}")
+                        shutil.move(r["path"], dest)
+                        fallback = True
+                    moved += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("移文件到回收站失败 id=%s：%s", r["id"], exc)
+            execute("DELETE FROM media_items WHERE id = ?", (r["id"],))
+        execute("DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM media_tags)")
+        return {"removed": moved, "fallback": fallback,
+                "message": "已移到回收站" if not fallback else "系统无回收站，已暂存待彻底删除"}
+
+    @app.post("/api/media/move")
+    def api_media_move(req: MediaMoveRequest) -> dict:
+        """把选中的媒体文件移动到指定目录，并更新数据库记录（folder_id + path）。"""
+        if not req.media_ids:
+            raise HTTPException(400, "未指定媒体")
+        dest_dir = os.path.abspath(req.dest_dir)
+        if not os.path.isdir(dest_dir):
+            raise HTTPException(400, f"目标目录不存在：{dest_dir}")
+        folder = query_one("SELECT id FROM folders WHERE path = ?", (dest_dir,))
+        if not folder:
+            raise HTTPException(400, f"目标目录未入库：{dest_dir}（请先导入该目录）")
+        ph = ",".join("?" * len(req.media_ids))
+        rows = query_all(f"SELECT id, path, filename FROM media_items WHERE id IN ({ph})", req.media_ids)
+        moved = 0
+        for r in rows:
+            if not os.path.exists(r["path"]):
+                execute("DELETE FROM media_items WHERE id = ?", (r["id"],))
+                continue
+            src = r["path"]
+            dest = os.path.join(dest_dir, os.path.basename(src))
+            if os.path.abspath(dest) == os.path.abspath(src):
+                continue
+            try:
+                if os.path.exists(dest):
+                    stem, ext = os.path.splitext(os.path.basename(src))
+                    i = 1
+                    while os.path.exists(dest):
+                        dest = os.path.join(dest_dir, f"{stem}_{i}{ext}")
+                        i += 1
+                os.rename(src, dest)
+            except OSError:
+                try:
+                    shutil.move(src, dest)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("移动文件失败 id=%s：%s", r["id"], exc)
+                    continue
+            execute("UPDATE media_items SET path = ?, folder_id = ? WHERE id = ?",
+                    (dest, folder["id"], r["id"]))
+            moved += 1
+        return {"moved": moved}
 
     @app.post("/api/media/add")
     def api_media_add(req: MediaAddRequest) -> dict:
