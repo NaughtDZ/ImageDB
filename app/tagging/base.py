@@ -373,7 +373,9 @@ class OnnxTaggerPlugin(TaggerPlugin):
             self.set_error("v2 词汇表格式不支持")
             return False
         self.tag_names = [str(v) for v in data.values()] if isinstance(data, dict) else []
-        self.tag_categories = ["" for _ in self.tag_names]
+        # v2 词汇表通常不含分类信息；设为空列表而非全空字符串，
+        # 避免触发 has_string_cats=True 走分类过滤而把所有标签丢弃。
+        self.tag_categories = []
         if not self.tag_names:
             self.set_error("v2 词汇表为空")
             return False
