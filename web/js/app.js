@@ -37,6 +37,8 @@ const App = {
     Gallery.initThumbSlider();
     // 初始化右侧标签侧边栏
     SidePanel.init();
+    // 初始化目录标签管理
+    FolderTags.init();
   },
 
   /** 绑定顶栏与全局事件 */

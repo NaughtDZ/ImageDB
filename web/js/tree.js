@@ -145,6 +145,7 @@ const TreeView = {
         App.state.currentFolderId = node.id;
         Tagger.openWithFolder(node.id);
       } },
+      { label: "管理目录标签…", fn: () => FolderTags.open(node) },
       { label: "添加图片到该目录…", fn: () => this.addMedia(node) },
       { label: "校验缺失", fn: () => this.verify(node) },
       { label: "从库中移除（仅删记录）", fn: () => this.remove(node) },

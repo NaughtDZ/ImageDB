@@ -82,6 +82,12 @@ class TagListRequest(BaseModel):
     tags: list[str]
 
 
+
+class FolderTagRequest(BaseModel):
+    """目录标签批量操作：不需要 media_ids，作用于整个目录子树。"""
+    tags: list[str]
+    action: str = "add"          # add / remove
+
 class BatchTagRequest(BaseModel):
     """批量添加/移除标签（应用到多个媒体）。"""
     media_ids: list[int]
@@ -604,6 +610,71 @@ def create_app(config: AppConfig) -> FastAPI:
             (like, limit),
         )
         return {"tags": [{"name": r["name"], "count": r["c"]} for r in rows]}
+    @app.get("/api/library/{folder_id}/tags")
+    def api_folder_tags(folder_id: int) -> dict:
+        """统计某目录（含子目录）下所有媒体标签的聚合（名称 + 媒体数 + 覆盖数）。"""
+        # 校验目录存在
+        folder = query_one("SELECT id FROM folders WHERE id = ?", (folder_id,))
+        if not folder:
+            raise HTTPException(404, "目录不存在")
+        rows = query_all(
+            """WITH RECURSIVE sub(id) AS (
+                   SELECT id FROM folders WHERE id = ?
+                   UNION ALL
+                   SELECT f.id FROM folders f JOIN sub s ON f.parent_id = s.id
+               )
+               SELECT t.name, COUNT(mt.media_id) AS media_count
+               FROM tags t
+               JOIN media_tags mt ON mt.tag_id = t.id
+               JOIN media_items m ON m.id = mt.media_id
+               WHERE m.folder_id IN (SELECT id FROM sub)
+               GROUP BY t.id, t.name
+               ORDER BY media_count DESC, t.name""",
+            (folder_id,),
+        )
+        return {"tags": [{"name": r["name"], "media_count": r["media_count"]} for r in rows]}
+
+    @app.post("/api/library/{folder_id}/tags")
+    def api_folder_tag_apply(folder_id: int, req: FolderTagRequest) -> dict:
+        """对整个目录（含子目录）的所有媒体批量添加/移除标签。"""
+        folder = query_one("SELECT id FROM folders WHERE id = ?", (folder_id,))
+        if not folder:
+            raise HTTPException(404, "目录不存在")
+        # 收集目录子树下所有媒体 id
+        media_ids = [r["id"] for r in query_all(
+            """WITH RECURSIVE sub(id) AS (
+                   SELECT id FROM folders WHERE id = ?
+                   UNION ALL
+                   SELECT f.id FROM folders f JOIN sub s ON f.parent_id = s.id
+               )
+               SELECT m.id FROM media_items m JOIN sub s ON m.folder_id = s.id""",
+            (folder_id,),
+        )]
+        if not media_ids:
+            raise HTTPException(400, "该目录下没有媒体文件")
+        count = 0
+        for name in req.tags:
+            name = (name or "").strip()
+            if not name:
+                continue
+            if req.action == "add":
+                tag_row = query_one("SELECT id FROM tags WHERE name = ?", (name,))
+                tag_id = tag_row["id"] if tag_row else execute(
+                    "INSERT INTO tags(name, source) VALUES (?, 'manual')", (name,))
+                executemany(
+                    "INSERT OR IGNORE INTO media_tags(media_id, tag_id, confidence, source) VALUES (?, ?, 1.0, 'manual')",
+                    [(mid, tag_id) for mid in media_ids],
+                )
+                count += 1
+            else:
+                tag_row = query_one("SELECT id FROM tags WHERE name = ?", (name,))
+                if tag_row:
+                    count += execute_rowcount(
+                        "DELETE FROM media_tags WHERE tag_id = ? AND media_id IN (%s)" % ",".join("?" * len(media_ids)),
+                        [tag_row["id"]] + media_ids,
+                    )
+        return {"ok": True, "count": count, "media": len(media_ids)}
+
 
     @app.post("/api/media/tags/batch")
     def api_batch_tags(req: BatchTagRequest) -> dict:

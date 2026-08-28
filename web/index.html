@@ -213,6 +213,24 @@
 </div>
 
 <!-- ========== 设置对话框 ========== -->
+<!-- ========== 目录标签管理对话框 ========== -->
+<div id="folder-tags-modal" class="modal hidden">
+  <div class="dialog wide">
+    <div class="dialog-head">🏷 管理目录标签 <span id="folder-tags-title" style="color:var(--text-dim);font-weight:normal"></span>
+      <button class="btn close" data-close="folder-tags-modal">✕</button></div>
+    <div class="dialog-body">
+      <div class="form-row">
+        <input id="folder-tag-input" type="text" list="folder-tags-suggest"
+               placeholder="输入标签名，添加到目录内所有文件（回车）">
+        <datalist id="folder-tags-suggest"></datalist>
+        <button id="btn-folder-tag-add" class="btn primary">＋ 添加到全部</button>
+      </div>
+      <div class="hint">显示该目录（含子目录）下所有文件的标签聚合。</div>
+      <div id="folder-tags-info" class="msg" style="margin-bottom:8px"></div>
+      <div id="folder-tags-list" class="tag-chips" style="flex-direction:column;align-items:stretch;gap:6px"></div>
+    </div>
+  </div>
+</div>
 <div id="settings-modal" class="modal hidden">
   <div class="dialog wide">
     <div class="dialog-head">⚙ 设置 <button class="btn close" data-close="settings-modal">✕</button></div>
@@ -341,6 +359,7 @@
 <script src="js/tagger.js"></script>
 <script src="js/tags.js"></script>
 <script src="js/panel.js"></script>
+<script src="js/folder_tags.js"></script>
 <script src="js/settings.js"></script>
 </body>
 </html>
