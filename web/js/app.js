@@ -39,6 +39,7 @@ const App = {
     SidePanel.init();
     // 初始化目录标签管理
     FolderTags.init();
+    Recycle.init();
   },
 
   /** 绑定顶栏与全局事件 */
@@ -74,6 +75,7 @@ const App = {
     document.getElementById("btn-delete-sel").onclick = () => this.deleteSelected();
     document.getElementById("btn-trash-sel").onclick = () => this.trashSelected();
     document.getElementById("btn-move-sel").onclick = () => this.moveSelected();
+    document.getElementById("btn-recycle").onclick = () => Recycle.open();
 
     document.getElementById("sort-select").onchange = () => Gallery.load(true);
 
@@ -202,7 +204,8 @@ const App = {
     }
   },
 
-  /** 把选中的素材移到回收站（需输入 yes 确认；无回收站系统需输入两次 yes） */
+  /** 把选中的素材移到回收站（需输入 yes 确认）。
+   * 本地固定盘进系统回收站；网络/可移动盘进"应用内回收站"（可还原）。 */
   async trashSelected() {
     const sel = [...this.state.selected];
     if (sel.length === 0) { toast("请先选择要移到回收站的素材", "err"); return; }
@@ -214,16 +217,9 @@ const App = {
     if (ok !== "yes") return;
     try {
       const res = await API.post("/api/media/trash", { media_ids: sel });
-      if (res.fallback) {
-        // 无回收站系统：需输入第二次 yes 确认彻底删除
-        const ok2 = await promptDialog({
-          title: "系统无回收站，确认彻底删除",
-          message: "当前系统不支持回收站！这些文件将被彻底删除且不可还原。再输入一次 yes 确认：（这是第二次确认）",
-          placeholder: "yes",
-        });
-        if (ok2 !== "yes") { toast("已取消（文件保留在暂存区）", "err"); return; }
-      }
-      toast(res.message || "已移到回收站", "ok");
+      // app_trash>0 表示已移入"应用内回收站"（可从回收站功能还原），否则为系统回收站
+      const note = res.app_trash > 0 ? "（可从回收站功能还原）" : "";
+      toast((res.message || "已移到回收站") + note, "ok");
       this.state.selected.clear();
       this.state.lastAnchor = null;
       await Gallery.load(true);

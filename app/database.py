@@ -27,6 +27,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 THUMBS_DIR = os.path.join(DATA_DIR, "thumbs")
 FRAMES_DIR = os.path.join(DATA_DIR, "frames")
+RECYCLE_DIR = os.path.join(DATA_DIR, "recycle_bin")
 
 # SQLite 数据库文件
 DB_PATH = os.path.join(DATA_DIR, "imagedb.sqlite")
@@ -112,12 +113,31 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- 应用内回收站表：记录从"不支持系统回收站"的盘（如网络盘）移入本地暂存的素材，
+-- 支持在本应用内"还原/恢复"与"清空"。标签以 JSON 快照保存，恢复时一并写回。
+CREATE TABLE IF NOT EXISTS recycle_bin (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    media_id    INTEGER,                    -- 原 media_items.id（恢复时复用该 id）
+    folder_id   INTEGER,                    -- 原所属目录 id
+    path        TEXT NOT NULL,              -- 原磁盘绝对路径（恢复时移回）
+    filename    TEXT NOT NULL,              -- 文件名
+    type        TEXT NOT NULL,              -- 'image' / 'video'
+    ext         TEXT,                       -- 扩展名
+    size        INTEGER DEFAULT 0,          -- 字节数
+    mtime       REAL DEFAULT 0,             -- 文件修改时间
+    thumbnail   TEXT,                       -- 原缩略图相对路径
+    stored_path TEXT,                       -- 现在暂存在本地回收站的路径
+    tags_json   TEXT,                       -- 标签快照（JSON，恢复时重新写回）
+    created_at  TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_recycle_media ON recycle_bin(media_id);
 """
 
 
 def ensure_dirs() -> None:
     """确保数据目录存在。"""
-    for d in (DATA_DIR, THUMBS_DIR, FRAMES_DIR):
+    for d in (DATA_DIR, THUMBS_DIR, FRAMES_DIR, RECYCLE_DIR):
         os.makedirs(d, exist_ok=True)
 
 

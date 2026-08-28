@@ -89,6 +89,7 @@
         <button id="btn-delete-sel" class="btn" title="从数据库中删除选中项（不删除磁盘文件）">🗑 删除选中</button>
         <button id="btn-trash-sel" class="btn" title="把选中文件移到回收站（需输入 yes 确认）">♻ 移到回收站</button>
         <button id="btn-move-sel" class="btn" title="把选中文件移动到其他目录（需输入 yes 确认）">📁 移动</button>
+        <button id="btn-recycle" class="btn" title="查看/还原应用内回收站的素材（来自不支持系统回收站的盘）">♻ 回收站</button>
         <button id="btn-clear-sel" class="btn">清除选择</button>
       </div>
     </div>
@@ -337,6 +338,20 @@
 </div>
 
 <!-- ========== 通用确认/输入对话框 ========== -->
+<div id="recycle-modal" class="modal hidden">
+  <div class="dialog wide">
+    <div class="dialog-head">♻ 应用回收站 <button class="btn close" data-close="recycle-modal">✕</button></div>
+    <div class="dialog-body">
+      <div id="recycle-info" class="panel-info"></div>
+      <div id="recycle-list" class="recycle-list"></div>
+    </div>
+    <div class="dialog-foot">
+      <button id="recycle-refresh" class="btn">↻ 刷新</button>
+      <button id="recycle-clear-all" class="btn danger">🗑 清空回收站</button>
+    </div>
+  </div>
+</div>
+
 <div id="prompt-modal" class="modal hidden">
   <div class="dialog">
     <div class="dialog-head"><span id="prompt-title">输入</span></div>
@@ -362,6 +377,7 @@
 <script src="js/tags.js"></script>
 <script src="js/panel.js"></script>
 <script src="js/folder_tags.js"></script>
+<script src="js/recycle.js"></script>
 <script src="js/settings.js"></script>
 </body>
 </html>

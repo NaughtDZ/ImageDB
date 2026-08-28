@@ -35,8 +35,10 @@ API 概览：
 """
 from __future__ import annotations
 
+import ctypes
 import json
 import shutil
+import sys
 import logging
 import os
 import threading
@@ -51,13 +53,64 @@ from pydantic import BaseModel
 
 from . import library, media as media_service
 from .config import AppConfig
-from .database import (DATA_DIR, FRAMES_DIR, THUMBS_DIR, execute, execute_rowcount,
+from .database import (DATA_DIR, FRAMES_DIR, THUMBS_DIR, RECYCLE_DIR, execute, execute_rowcount,
                       executemany, query_all, query_one)
 from .downloader import (download_model, install_directml,
                       list_jobs as list_dl_jobs, test_proxy, update_deps)
 from .tagging import manager as tagging_manager
 
 logger = logging.getLogger("imagedb.server")
+# send2trash 用于把文件移到系统回收站（Windows/macOS/Linux 均支持本地文件系统）。
+# 若未安装则降级：一律走应用内回收站（移到本地暂存，可还原），绝不完全删除磁盘文件。
+try:
+    from send2trash import send2trash
+    HAS_SEND2TRASH = True
+except ImportError:
+    send2trash = None
+    HAS_SEND2TRASH = False
+
+
+def _os_recycle_supported(path: str) -> bool:
+    """判断该路径是否适合走系统的"真正回收站"。
+
+    - 非 Windows（macOS/Linux）：send2trash 都能正常进系统回收站，返回 True；
+    - Windows：仅本地固定盘（DRIVE_FIXED）有系统回收站；网络盘/可移动盘/光驱等没有，
+      send2trash 在那些盘上会静默变成"彻底删除"，因此返回 False 改走应用内回收站，
+      确保任何情况下都不丢数据。
+    """
+    if not HAS_SEND2TRASH:
+        return False
+    if sys.platform != "win32":
+        return True
+    try:
+        drive = os.path.splitdrive(path)[0]
+        if not drive:
+            return False  # 无盘符（异常路径）→ 保守走应用内回收站
+        root = drive + os.sep
+        drive_type = ctypes.windll.kernel32.GetDriveTypeW(root)
+        return drive_type == 3  # DRIVE_FIXED
+    except Exception:
+        return False  # 判定失败 → 保守走应用内回收站（不丢数据）
+
+
+def _app_trash_move(row: dict, tags: list[dict]) -> str:
+    """把文件移到本地"应用内回收站" data/recycle_bin/，并写入 recycle_bin 表（可还原）。
+
+    返回暂存路径。标签以 JSON 快照保存，恢复时一并写回，避免丢失标签元数据。
+    """
+    os.makedirs(RECYCLE_DIR, exist_ok=True)
+    dest = os.path.join(RECYCLE_DIR, f"{row['id']}_{os.path.basename(row['path'])}")
+    shutil.move(row["path"], dest)
+    tags_json = json.dumps(
+        [{"name": t["name"], "confidence": t.get("confidence", 1.0),
+          "source": t.get("source", "manual")} for t in tags],
+        ensure_ascii=False)
+    execute(
+        "INSERT INTO recycle_bin(media_id, folder_id, path, filename, type, ext, size, mtime, "
+        "thumbnail, stored_path, tags_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (row["id"], row["folder_id"], row["path"], row["filename"], row["type"],
+         row["ext"], row["size"], row["mtime"], row["thumbnail"], dest, tags_json))
+    return dest
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB_DIR = os.path.join(BASE_DIR, "web")
@@ -115,6 +168,11 @@ class MediaDeleteRequest(BaseModel):
 class MediaTrashRequest(BaseModel):
     """把媒体文件移到回收站（无回收站系统则彻底删除需二次确认）。"""
     media_ids: list[int]
+
+
+class RecycleIdsRequest(BaseModel):
+    """应用内回收站批量操作请求。"""
+    ids: list[int]
 
 
 class MediaMoveRequest(BaseModel):
@@ -496,41 +554,52 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @app.post("/api/media/trash")
     def api_media_trash(req: MediaTrashRequest) -> dict:
-        """把选中的媒体文件移到回收站（Windows/macOS 用 send2trash），并删除数据库记录。
-        若系统不支持回收站（极端情况），移到 data/trash_pending/ 暂存，标记 fallback=True，
-        前端会要求用户输入两次 yes 才真正处理。绝不直接彻底删除磁盘文件。"""
+        """把选中的媒体文件移到回收站。
+
+        - 文件所在盘支持系统回收站（本地固定盘）→ send2trash 进系统回收站（文件管理器可还原）；
+        - 文件所在盘不支持系统回收站（网络盘/可移动盘等）→ 移到本地 data/recycle_bin/ 作"应用内回收站"，
+          本应用可还原，绝不彻底删除磁盘文件，确保任何情况都不丢数据。
+        """
         if not req.media_ids:
             raise HTTPException(400, "未指定媒体")
-        try:
-            from send2trash import send2trash
-            has_trash = True
-        except ImportError:
-            has_trash = False
-            send2trash = None
         ph = ",".join("?" * len(req.media_ids))
-        rows = query_all(f"SELECT id, path FROM media_items WHERE id IN ({ph})", req.media_ids)
-        moved = 0
-        fallback = False
+        rows = query_all(
+            "SELECT id, folder_id, path, filename, type, ext, size, mtime, thumbnail "
+            f"FROM media_items WHERE id IN ({ph})", req.media_ids)
+        os_trash = 0
+        app_trash = 0
         for r in rows:
-            media_service.delete_thumbnails([r["id"]])   # 清理缩略图缓存
             try:
-                if os.path.exists(r["path"]):
-                    if has_trash:
-                        send2trash(r["path"])   # 移到回收站
-                    else:
-                        # 无回收站：移到暂存目录（不彻底删除），要求二次确认
-                        pending = os.path.join(DATA_DIR, "trash_pending")
-                        os.makedirs(pending, exist_ok=True)
-                        dest = os.path.join(pending, f"{r['id']}_{os.path.basename(r['path'])}")
-                        shutil.move(r["path"], dest)
-                        fallback = True
-                    moved += 1
+                if not os.path.exists(r["path"]):
+                    # 文件已被外部删除：仅清理数据库记录
+                    execute("DELETE FROM media_items WHERE id = ?", (r["id"],))
+                    continue
+                if _os_recycle_supported(r["path"]):
+                    send2trash(r["path"])                       # 进系统回收站
+                    media_service.delete_thumbnails([r["id"]])  # 清理缩略图缓存
+                    os_trash += 1
+                else:
+                    # 该盘不支持系统回收站（如网络盘 K:）：移到应用内回收站，可还原
+                    tags = query_all(
+                        "SELECT mt.tag_id, mt.confidence, mt.source, t.name "
+                        "FROM media_tags mt JOIN tags t ON t.id = mt.tag_id WHERE mt.media_id = ?",
+                        (r["id"],))
+                    _app_trash_move(r, tags)
+                    app_trash += 1
+                execute("DELETE FROM media_items WHERE id = ?", (r["id"],))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("移文件到回收站失败 id=%s：%s", r["id"], exc)
-            execute("DELETE FROM media_items WHERE id = ?", (r["id"],))
+                continue  # 失败时保留记录，避免数据库与磁盘不一致
         execute("DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM media_tags)")
-        return {"removed": moved, "fallback": fallback,
-                "message": "已移到回收站" if not fallback else "系统无回收站，已暂存待彻底删除"}
+        if os_trash and app_trash:
+            msg = f"{os_trash} 个已移到系统回收站，{app_trash} 个已移入应用回收站（可还原）"
+        elif os_trash:
+            msg = f"{os_trash} 个已移到系统回收站"
+        else:
+            msg = f"{app_trash} 个已移入应用回收站（可用回收站功能还原）"
+        return {"removed": os_trash + app_trash, "os_trash": os_trash,
+                "app_trash": app_trash, "message": msg}
+
 
     @app.post("/api/media/move")
     def api_media_move(req: MediaMoveRequest) -> dict:
@@ -572,6 +641,84 @@ def create_app(config: AppConfig) -> FastAPI:
                     (dest, folder["id"], r["id"]))
             moved += 1
         return {"moved": moved}
+
+    # ================= 应用内回收站 =================
+    @app.get("/api/recycle/list")
+    def api_recycle_list() -> dict:
+        """列出应用内回收站的素材（不含已进系统回收站的部分）。"""
+        rows = query_all("SELECT * FROM recycle_bin ORDER BY id DESC")
+        return {"items": rows}
+
+
+    @app.post("/api/recycle/restore")
+    def api_recycle_restore(req: RecycleIdsRequest) -> dict:
+        """把应用内回收站的素材还原到原目录，并恢复数据库记录（含原标签、缩略图）。"""
+        if not req.ids:
+            raise HTTPException(400, "未指定回收站条目")
+        ph = ",".join("?" * len(req.ids))
+        rows = query_all(f"SELECT * FROM recycle_bin WHERE id IN ({ph})", req.ids)
+        restored = 0
+        errors: list[str] = []
+        for r in rows:
+            try:
+                folder = query_one("SELECT id FROM folders WHERE id = ?", (r["folder_id"],))
+                if not folder:
+                    errors.append(f"{r['filename']}：原目录已从库中移除，无法还原")
+                    continue
+                if os.path.exists(r["path"]):
+                    errors.append(f"{r['filename']}：原位置已存在同名文件，未还原")
+                    continue
+                if os.path.exists(r["stored_path"]):
+                    shutil.move(r["stored_path"], r["path"])
+                execute(
+                    "INSERT INTO media_items(id, folder_id, path, filename, type, ext, size, "
+                    "mtime, thumbnail, status) VALUES (?,?,?,?,?,?,?,?,?, 'ok')",
+                    (r["media_id"], r["folder_id"], r["path"], r["filename"], r["type"],
+                     r["ext"], r["size"], r["mtime"], r["thumbnail"]))
+                if r.get("tags_json"):
+                    for tg in json.loads(r["tags_json"]):
+                        name = (tg.get("name") or "").strip()
+                        if not name:
+                            continue
+                        tag_row = query_one("SELECT id FROM tags WHERE name = ?", (name,))
+                        if tag_row:
+                            tag_id = tag_row["id"]
+                        else:
+                            tag_id = execute(
+                                "INSERT INTO tags(name, source) VALUES (?, ?)",
+                                (name, tg.get("source", "manual")))
+                        execute(
+                            "INSERT OR IGNORE INTO media_tags(media_id, tag_id, confidence, source) "
+                            "VALUES (?,?,?,?)",
+                            (r["media_id"], tag_id, tg.get("confidence", 1.0),
+                             tg.get("source", "manual")))
+                execute("DELETE FROM recycle_bin WHERE id = ?", (r["id"],))
+                restored += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("还原失败 id=%s：%s", r["id"], exc)
+                errors.append(f"{r['filename']}：{exc}")
+        return {"restored": restored, "errors": errors}
+
+
+    @app.post("/api/recycle/delete")
+    def api_recycle_delete(req: RecycleIdsRequest) -> dict:
+        """从应用内回收站中永久删除素材（前端需二次确认）。"""
+        if not req.ids:
+            raise HTTPException(400, "未指定回收站条目")
+        ph = ",".join("?" * len(req.ids))
+        rows = query_all(f"SELECT * FROM recycle_bin WHERE id IN ({ph})", req.ids)
+        deleted = 0
+        for r in rows:
+            try:
+                media_service.delete_thumbnails([r["media_id"]])
+                if os.path.exists(r["stored_path"]):
+                    os.remove(r["stored_path"])
+                execute("DELETE FROM recycle_bin WHERE id = ?", (r["id"],))
+                deleted += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("彻底删除失败 id=%s：%s", r["id"], exc)
+        return {"deleted": deleted}
+
 
     @app.post("/api/media/add")
     def api_media_add(req: MediaAddRequest) -> dict:
