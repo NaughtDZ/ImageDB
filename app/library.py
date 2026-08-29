@@ -179,6 +179,57 @@ def count_media_files(root_path: str) -> tuple[int, int]:
     return total_dirs[0], total_files[0]
 
 
+def _find_nearest_ancestor(path: str) -> tuple[str, int] | None:
+    """从 path 的父目录起向上，找最近一个已导入的祖先目录。
+
+    返回 (祖先路径, 祖先目录 id)；若没有已导入祖先则返回 None。
+    用于"导入目录若落在某个已导入目录之下，则自动复用其作为父目录"。
+    """
+    parent = os.path.dirname(os.path.abspath(path))
+    while parent and parent != os.path.dirname(parent):
+        row = query_one("SELECT id, path FROM folders WHERE path = ?", (parent,))
+        if row:
+            return row["path"], row["id"]
+        parent = os.path.dirname(parent)
+    return None
+
+
+def _prepare_parent_for_import(path: str) -> tuple[int | None, int]:
+    """为导入的根目录确定父目录 id（并补建缺失的中间目录链）。
+
+    返回 (parent_id, is_root)：
+    - 若 path 的某级祖先目录已在库中（如已导入父目录），则把最近祖先作为父目录，
+      并沿路径从上到下补建缺失的中间目录（is_root=0）。返回 (最近父目录 id, 0)。
+    - 若没有任何已导入祖先，则作为独立顶层根目录，返回 (None, 1)。
+    性能说明：仅在根导入时执行，祖先查找为逐级索引查询（约等于路径深度次，通常 1~2 次）；
+    对子目录逐个插入的原有精确路径查询开销不变，因此不会随子目录数量放大。
+    """
+    root = os.path.abspath(path)
+    hit = _find_nearest_ancestor(root)
+    if not hit:
+        return None, 1
+    anc_path, anc_id = hit
+    parent_path = os.path.dirname(root)   # 导入目录的父目录（挂载点）
+    # 收集 anc_path 与 parent_path 之间缺失的中间目录（不含 anc_path，含 parent_path），自上而下补建
+    chain: list[str] = []
+    cur = parent_path
+    while cur and os.path.normcase(os.path.normpath(cur)) != os.path.normcase(os.path.normpath(anc_path)):
+        chain.append(cur)
+        nxt = os.path.dirname(cur)
+        if nxt == cur:   # 已到根，安全退出
+            break
+        cur = nxt
+    chain.reverse()
+    parent_id = anc_id
+    for d in chain:
+        row = query_one("SELECT id FROM folders WHERE path = ?", (d,))
+        if row:
+            parent_id = row["id"]
+        else:
+            parent_id = _insert_folder(os.path.basename(d) or d, d, parent_id)
+    return parent_id, 0
+
+
 def import_folder(root_path: str) -> dict:
     """
     导入一个目录（及其全部子目录）：
@@ -190,9 +241,10 @@ def import_folder(root_path: str) -> dict:
     if not os.path.isdir(root_path):
         raise ValueError(f"目录不存在：{root_path}")
 
+    parent_id, is_root = _prepare_parent_for_import(root_path)
     root_id = _insert_folder(
         os.path.basename(root_path.rstrip(os.sep)) or root_path,
-        root_path, None, is_root=1,
+        root_path, parent_id, is_root=is_root,
     )
     logger.info("开始导入目录：%s", root_path)
 
@@ -226,9 +278,10 @@ def import_folder_progress(root_path: str, progress_cb=None) -> dict:
     if not os.path.isdir(root_path):
         raise ValueError(f"目录不存在：{root_path}")
 
+    parent_id, is_root = _prepare_parent_for_import(root_path)
     root_id = _insert_folder(
         os.path.basename(root_path.rstrip(os.sep)) or root_path,
-        root_path, None, is_root=1,
+        root_path, parent_id, is_root=is_root,
     )
     logger.info("开始导入目录：%s", root_path)
 
