@@ -29,6 +29,20 @@ logger = logging.getLogger("imagedb.tagging.manager")
 # 插件目录（app/tagging/plugins/）
 PLUGINS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins")
 
+# SQLite 单条 SQL 中 IN (...) 占位符（绑定变量）数量有上限：
+#   旧版默认 999，新版（>=3.32.1）为 32766，且随编译参数不同。
+# 对整个大目录打标时 target_ids 可能上万，直接拼进 IN (?,?,...) 会抛
+#   sqlite3.OperationalError: too many SQL variables
+# 统一按块切分查询，规避该问题。块大小取保守值，兼容旧版 999 上限。
+_IN_CHUNK_SIZE = 500
+
+
+def _chunked(ids):
+    """把 id 列表切成小块，每块的 IN (...) 绑定变量数不超过 _IN_CHUNK_SIZE。"""
+    n = _IN_CHUNK_SIZE
+    for i in range(0, len(ids), n):
+        yield ids[i:i + n]
+
 
 class PluginManager:
     """打标插件管理器。"""
@@ -152,15 +166,18 @@ class PluginManager:
 
         # 优化：不覆盖时，跳过已用该工具打标过的媒体（只推理新增/未打标的）。
         # 例如目录几千张已打标、新加几十张，右键整目录打标时只处理新增的。
+        # 注意：大目录（上万张）会使 IN (...) 绑定变量超限，必须分块查询。
         if not overwrite:
             try:
-                ph = ",".join("?" * len(target_ids))
-                done_rows = query_all(
-                    f"SELECT DISTINCT media_id FROM media_tags"
-                    f" WHERE media_id IN ({ph}) AND source = ?",
-                    target_ids + [tool],
-                )
-                done_ids = {r["media_id"] for r in done_rows}
+                done_ids: set[int] = set()
+                for chunk in _chunked(target_ids):
+                    ph = ",".join("?" * len(chunk))
+                    for r in query_all(
+                        f"SELECT DISTINCT media_id FROM media_tags"
+                        f" WHERE media_id IN ({ph}) AND source = ?",
+                        chunk + [tool],
+                    ):
+                        done_ids.add(r["media_id"])
                 if done_ids:
                     already = len(done_ids)
                     target_ids = [mid for mid in target_ids if mid not in done_ids]
@@ -185,12 +202,14 @@ class PluginManager:
         parallel = cfg_provider.get_int("tagging_parallel", 4)
         parallel = max(1, min(parallel, 64))   # 限制在 1~64
 
-        # 预取全部媒体行（减少逐条查询数据库）
-        ph = ",".join("?" * len(target_ids))
+        # 预取全部媒体行（减少逐条查询数据库）。
+        # 目标可能上万：分块查询，避免 IN (...) 绑定变量超限。
         rows_by_id: dict[int, dict] = {}
-        for r in query_all(
-            f"SELECT * FROM media_items WHERE id IN ({ph})", target_ids):
-            rows_by_id[r["id"]] = r
+        for chunk in _chunked(target_ids):
+            ph = ",".join("?" * len(chunk))
+            for r in query_all(
+                f"SELECT * FROM media_items WHERE id IN ({ph})", chunk):
+                rows_by_id[r["id"]] = r
 
         done = 0
         batch_rows: list[dict] = []

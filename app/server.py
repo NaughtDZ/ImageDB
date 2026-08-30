@@ -907,10 +907,13 @@ def create_app(config: AppConfig) -> FastAPI:
             else:
                 tag_row = query_one("SELECT id FROM tags WHERE name = ?", (name,))
                 if tag_row:
-                    count += execute_rowcount(
-                        "DELETE FROM media_tags WHERE tag_id = ? AND media_id IN (%s)" % ",".join("?" * len(media_ids)),
-                        [tag_row["id"]] + media_ids,
-                    )
+                    # 整个目录子树可能上万：分块删除，避免 IN (...) 绑定变量超限
+                    for chunk in tagging_manager._chunked(media_ids):
+                        ph = ",".join("?" * len(chunk))
+                        count += execute_rowcount(
+                            "DELETE FROM media_tags WHERE tag_id = ? AND media_id IN (%s)" % ph,
+                            [tag_row["id"]] + chunk,
+                        )
         return {"ok": True, "count": count, "media": len(media_ids)}
 
 
