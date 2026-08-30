@@ -35,6 +35,18 @@ DB_PATH = os.path.join(DATA_DIR, "imagedb.sqlite")
 # 写操作互斥锁
 _write_lock = threading.Lock()
 
+# SQLite 单条 SQL 中 IN (...) 占位符（绑定变量）数量有上限：
+#   旧版默认 999，新版（>=3.32.1）为 32766，且随编译参数不同。
+# 对可能上万 id 的列表，统一按块切分，避免抛 "too many SQL variables"。
+SQLITE_IN_CHUNK_SIZE = 500
+
+
+def chunk_ids(ids):
+    """把 id 列表切成小块，每块的 IN (...) 绑定变量数不超过 SQLITE_IN_CHUNK_SIZE。"""
+    n = SQLITE_IN_CHUNK_SIZE
+    for i in range(0, len(ids), n):
+        yield ids[i:i + n]
+
 # 数据库表结构
 SCHEMA = """
 -- 目录表：记录用户导入的目录及其子目录（构成程序内目录树）

@@ -54,7 +54,7 @@ from pydantic import BaseModel
 from . import library, media as media_service
 from .config import AppConfig
 from .database import (DATA_DIR, FRAMES_DIR, THUMBS_DIR, RECYCLE_DIR, execute, execute_rowcount,
-                      executemany, query_all, query_one)
+                      executemany, query_all, query_one, chunk_ids)
 from .downloader import (download_model, install_directml,
                       list_jobs as list_dl_jobs, test_proxy, update_deps)
 from .tagging import manager as tagging_manager
@@ -538,18 +538,22 @@ def create_app(config: AppConfig) -> FastAPI:
         同时清理缩略图文件与无引用的标签。"""
         if not req.media_ids:
             raise HTTPException(400, "未指定媒体")
-        ph = ",".join("?" * len(req.media_ids))
         # 删除缩略图文件
-        for r in query_all(f"SELECT thumbnail FROM media_items WHERE id IN ({ph})", req.media_ids):
-            if r["thumbnail"]:
-                tp = os.path.join(DATA_DIR, r["thumbnail"])
-                try:
-                    if os.path.isfile(tp):
-                        os.remove(tp)
-                except OSError:
-                    pass
-        removed = execute_rowcount(
-            f"DELETE FROM media_items WHERE id IN ({ph})", req.media_ids)
+        for chunk in chunk_ids(req.media_ids):
+            ph = ",".join("?" * len(chunk))
+            for r in query_all(f"SELECT thumbnail FROM media_items WHERE id IN ({ph})", chunk):
+                if r["thumbnail"]:
+                    tp = os.path.join(DATA_DIR, r["thumbnail"])
+                    try:
+                        if os.path.isfile(tp):
+                            os.remove(tp)
+                    except OSError:
+                        pass
+        removed = 0
+        for chunk in chunk_ids(req.media_ids):
+            ph = ",".join("?" * len(chunk))
+            removed += execute_rowcount(
+                f"DELETE FROM media_items WHERE id IN ({ph})", chunk)
         return {"removed": removed}
 
     @app.post("/api/media/trash")
@@ -562,10 +566,12 @@ def create_app(config: AppConfig) -> FastAPI:
         """
         if not req.media_ids:
             raise HTTPException(400, "未指定媒体")
-        ph = ",".join("?" * len(req.media_ids))
-        rows = query_all(
-            "SELECT id, folder_id, path, filename, type, ext, size, mtime, thumbnail "
-            f"FROM media_items WHERE id IN ({ph})", req.media_ids)
+        rows: list[dict] = []
+        for chunk in chunk_ids(req.media_ids):
+            ph = ",".join("?" * len(chunk))
+            rows.extend(query_all(
+                "SELECT id, folder_id, path, filename, type, ext, size, mtime, thumbnail "
+                f"FROM media_items WHERE id IN ({ph})", chunk))
         os_trash = 0
         app_trash = 0
         for r in rows:
@@ -612,8 +618,10 @@ def create_app(config: AppConfig) -> FastAPI:
         folder = query_one("SELECT id FROM folders WHERE path = ?", (dest_dir,))
         if not folder:
             raise HTTPException(400, f"目标目录未入库：{dest_dir}（请先导入该目录）")
-        ph = ",".join("?" * len(req.media_ids))
-        rows = query_all(f"SELECT id, path, filename FROM media_items WHERE id IN ({ph})", req.media_ids)
+        rows: list[dict] = []
+        for chunk in chunk_ids(req.media_ids):
+            ph = ",".join("?" * len(chunk))
+            rows.extend(query_all(f"SELECT id, path, filename FROM media_items WHERE id IN ({ph})", chunk))
         moved = 0
         for r in rows:
             if not os.path.exists(r["path"]):
@@ -655,8 +663,10 @@ def create_app(config: AppConfig) -> FastAPI:
         """把应用内回收站的素材还原到原目录，并恢复数据库记录（含原标签、缩略图）。"""
         if not req.ids:
             raise HTTPException(400, "未指定回收站条目")
-        ph = ",".join("?" * len(req.ids))
-        rows = query_all(f"SELECT * FROM recycle_bin WHERE id IN ({ph})", req.ids)
+        rows: list[dict] = []
+        for chunk in chunk_ids(req.ids):
+            ph = ",".join("?" * len(chunk))
+            rows.extend(query_all(f"SELECT * FROM recycle_bin WHERE id IN ({ph})", chunk))
         restored = 0
         errors: list[str] = []
         for r in rows:
@@ -705,8 +715,10 @@ def create_app(config: AppConfig) -> FastAPI:
         """从应用内回收站中永久删除素材（前端需二次确认）。"""
         if not req.ids:
             raise HTTPException(400, "未指定回收站条目")
-        ph = ",".join("?" * len(req.ids))
-        rows = query_all(f"SELECT * FROM recycle_bin WHERE id IN ({ph})", req.ids)
+        rows: list[dict] = []
+        for chunk in chunk_ids(req.ids):
+            ph = ",".join("?" * len(chunk))
+            rows.extend(query_all(f"SELECT * FROM recycle_bin WHERE id IN ({ph})", chunk))
         deleted = 0
         for r in rows:
             try:
@@ -923,9 +935,11 @@ def create_app(config: AppConfig) -> FastAPI:
         if not req.media_ids:
             raise HTTPException(400, "未指定媒体")
         # 校验媒体都存在
-        ph = ",".join("?" * len(req.media_ids))
-        exist = query_one(
-            f"SELECT COUNT(*) AS c FROM media_items WHERE id IN ({ph})", req.media_ids)["c"]
+        exist = 0
+        for chunk in chunk_ids(req.media_ids):
+            ph = ",".join("?" * len(chunk))
+            exist += query_one(
+                f"SELECT COUNT(*) AS c FROM media_items WHERE id IN ({ph})", chunk)["c"]
         if exist != len(req.media_ids):
             raise HTTPException(404, "部分媒体不存在（可能已被外部删除）")
         count = 0
@@ -948,10 +962,12 @@ def create_app(config: AppConfig) -> FastAPI:
             else:
                 tag_row = query_one("SELECT id FROM tags WHERE name = ?", (name,))
                 if tag_row:
-                    count += execute_rowcount(
-                        f"DELETE FROM media_tags WHERE tag_id = ? AND media_id IN ({ph})",
-                        [tag_row["id"]] + req.media_ids,
-                    )
+                    for chunk in chunk_ids(req.media_ids):
+                        del_ph = ",".join("?" * len(chunk))
+                        count += execute_rowcount(
+                            f"DELETE FROM media_tags WHERE tag_id = ? AND media_id IN ({del_ph})",
+                            [tag_row["id"]] + chunk,
+                        )
         return {"ok": True, "count": count}
 
     @app.post("/api/tags/rename")
