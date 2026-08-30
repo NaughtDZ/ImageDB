@@ -104,9 +104,23 @@ const Settings = {
       const div = document.createElement("div");
       div.className = "tool-config";
       div.style.cssText = "border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:10px";
+      let body;
+      if (name === "metadata") {
+        // 实验性工具：规则以 JSON 编辑
+        body = '<div class="form-row" style="align-items:flex-start"><label>规则(JSON)</label>' +
+               '<textarea id="cfg-metadata-rules" data-tool="metadata" data-key="rules"' +
+               ' style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);' +
+               'border-radius:4px;padding:6px;min-height:150px;outline:none;font-family:monospace;' +
+               'font-size:12px;white-space:pre">' +
+               escapeHtml(JSON.stringify(cfg.rules || [], null, 2)) + '</textarea></div>' +
+               '<div class="hint">每条规则字段：enabled、name、source(filename|metadata|all)、' +
+               'pattern(正则)、flags(i/m/s)、tag(模板，支持 {match}、$1、{name})、normalize(lower/upper)。' +
+               '示例：{"enabled":true,"name":"系列","source":"filename","tag":"$1"}</div>';
+      } else {
+        body = this.configFields(name, cfg);
+      }
       div.innerHTML =
-        '<div style="font-weight:600;margin-bottom:8px">🔧 ' + escapeHtml(name) + "</div>" +
-        this.configFields(name, cfg);
+        '<div style="font-weight:600;margin-bottom:8px">🔧 ' + escapeHtml(name) + "</div>" + body;
       box.appendChild(div);
     }
   },
@@ -187,6 +201,15 @@ const Settings = {
         else if (el.type === "number") cfg[key] = parseFloat(el.value) || 0;
         else cfg[key] = el.value;
       });
+      if (name === "metadata" && typeof cfg.rules === "string") {
+        try {
+          const arr = JSON.parse(cfg.rules || "[]");
+          cfg.rules = Array.isArray(arr) ? arr : [];
+        } catch (e2) {
+          cfg.rules = [];
+          toast("元数据规则 JSON 解析失败，已重置为空规则", "err");
+        }
+      }
       s["tool_" + name] = cfg;
     }
     return s;

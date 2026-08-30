@@ -60,6 +60,10 @@ DEFAULTS: dict[str, str] = {
         "prompt": "请用英文为这张图片生成 5-15 个标签，用逗号分隔，只输出标签列表，不要其他文字。",
         "timeout": 60,          # 请求超时（秒）
     }, ensure_ascii=False),
+    # ---- 实验性：元数据/正则打标（从文件名或附加元数据按正则提取 tag）----
+    "tool_metadata": json.dumps({
+        "rules": [],   # 规则列表：[{enabled,name,source:filename|metadata|all,pattern,flags,tag,normalize}]
+    }, ensure_ascii=False),
 }
 
 

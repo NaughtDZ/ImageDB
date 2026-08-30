@@ -12,11 +12,17 @@
 - **删除保护**：任何删除只动数据库记录，**磁盘文件永不删除**（缩略图缓存会自动清理）。
 
 ### 🏷 插件化打标（与程序本体解耦）
-- 内置三种打标工具：**cl-tagger**（cella110n）/ **wd14** / **自定义 LLM**；
+- 内置打标工具：**cl-tagger**（cella110n）/ **wd14** / **自定义 LLM** / **元数据·正则（实验）**；
 - **新增/移除工具 = 增删插件文件**（`app/tagging/plugins/`），无需改主程序；
 - **并行打标量**（设置→打标tab，默认4）：GPU → batch 批量推理、CPU → 线程池并行；
 - **视频打标**：按可配置间隔抽帧 → 逐帧打标 → 投票聚合标签；
 - 手动标签：单选/多选/框选后批量添加、移除、**全局重命名/删除**（应用到所有含该标签的素材）。
+
+### 💾 附加数据侧边栏（基础信息 + EXIF / IPTC / XMP）
+- 选中素材后，右侧「素材」栏在标签之外再分隔出一个**可拖拽调高**的「附加数据」分区；侧栏整体宽度也可拖拽调节（尺寸自动记忆）；
+- **基础信息**：文件名、完整路径、类型、大小、分辨率、创建/修改时间；图片显示**格式编码**，视频显示**编码格式、平均码率、时长**；
+- **附加元数据**：**EXIF**（设备/拍摄参数等）、**IPTC**（IIM：关键词/标题/作者/版权）、**XMP**（dc:subject/title/creator 等）；
+- **按需只读读取，不写数据库**：点开即从文件读取，解析失败返回空，绝不抛错（与程序解耦）；多选时默认显示第一张，结果会话内内存缓存。
 
 ### 🔍 多维搜索
 - 按**文件名**、**目录名**、**标签**、**类型**筛选；
@@ -90,7 +96,7 @@ pip install opencv-python-headless
 1. **导入目录**：顶栏「导入目录」（或左侧树 ＋）→ 输入目录绝对路径 → **进度条显示导入进度**；
 2. **打标**：单选/多选/框选媒体，或右键目录「整个目录打标」→ 选工具开始（自动并行加速）；
 3. **翻页浏览**：翻页立即看到文件名，缩略图陆续浮现；翻回已访问页秒显；
-4. **查看**：双击缩略图打开查看器（滚轮切图、幻灯片、视频控制）；
+4. **查看**：双击缩略图打开查看器（滚轮切图、幻灯片、视频控制）；选中素材后右侧「素材」栏可看**标签**与**附加数据**（基础信息 + EXIF/IPTC/XMP）；
 5. **搜索**：文件名 / 目录名 / 标签（空格分隔多标签 AND）；
 6. **维护**：顶栏「校验缺失」手动清理；后台定时自动校验；
 7. **管理**：右键目录删除记录、添加图片；选中媒体「🗑 删除选中」（仅数据库）。
@@ -110,6 +116,12 @@ pip install opencv-python-headless
 
 ### 自定义 LLM
 - 设置页配置 `base_url`（OpenAI 兼容接口）、`api_key`、`model`、`prompt`；走代理。
+
+### 元数据/正则打标（实验性）
+- 通过**正则规则**从文件名或附加元数据（EXIF/IPTC/XMP）提取标签；标签以 `source=metadata` 写入，可按来源管理；
+- 规则字段：`enabled / name / source(filename|metadata|all) / pattern / flags(i,m,s) / tag(模板：{match}、$1..$9、{name}) / normalize(lower|upper)`；
+- 配置：设置页 → 打标 → 「元数据/正则打标（实验）」的**规则 JSON** 编辑器；保存后插件自动重载；
+- 支持单个/多选/整个目录打标（实验版聚焦图片，视频抽帧暂不适用）；禁用可删除 `app/tagging/plugins/metadata.py` 或清空规则。
 
 ## 🔌 新增/移除打标工具
 
@@ -137,17 +149,18 @@ ImageDB/
 │   ├── database.py          # SQLite 层（唯一直接访问数据库的模块）
 │   ├── library.py           # 目录库：导入/进度/扫描/校验/目录树/删除
 │   ├── media.py             # 缩略图/视频抽帧/缓存清理/时长探测
+│   ├── metadata.py          # 按需读取附加数据(EXIF/IPTC/XMP)与文件基础信息（只读，不写库）
 │   ├── tagging/             # 打标子系统
 │   │   ├── base.py          # 插件基类 + 通用 ONNX 批量推理
 │   │   ├── manager.py       # 插件管理器 + 并行任务调度（GPU batch/CPU 线程池）
-│   │   └── plugins/         # 内置插件（cl_tagger / wd14 / llm）
+│   │   └── plugins/         # 内置插件（cl_tagger / wd14 / llm / metadata）
 │   ├── downloader.py        # 模型下载/URL 解析/代理测试/DirectML 安装
-│   └── server.py            # FastAPI 服务层（35 个 REST API + 静态资源）
+│   └── server.py            # FastAPI 服务层（REST API + 静态资源）
 └── web/                     # 前端（纯 HTML/CSS/JS，无构建步骤）
     ├── index.html
     ├── css/style.css
     ├── favicon.svg          # 二次元风图标（大动漫眼+相册书架）
-    └── js/                  # api / app / tree / gallery / viewer / tagger / tags / panel / settings
+    └── js/                  # api / app / tree / gallery / viewer / tagger / tags / panel / metadata_panel / settings
 ```
 
 ## 🗄 数据库与缓存说明
