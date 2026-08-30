@@ -51,7 +51,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import library, media as media_service
+from . import library, media as media_service, metadata as media_metadata
 from .config import AppConfig
 from .database import (DATA_DIR, FRAMES_DIR, THUMBS_DIR, RECYCLE_DIR, execute, execute_rowcount,
                       executemany, query_all, query_one, chunk_ids)
@@ -531,6 +531,17 @@ def create_app(config: AppConfig) -> FastAPI:
         ):
             d["tags"].append(t)
         return d
+
+    @app.get("/api/media/{mid}/metadata")
+    def api_media_metadata(mid: int) -> dict:
+        """按需读取媒体附加数据（EXIF/IPTC/XMP）。
+
+        只读取文件本身，不写入数据库；文件缺失/解析失败时返回空段。
+        """
+        row = _require_media(mid, auto_clean=False)
+        m = media_metadata.extract_metadata(row["path"], row["type"])
+        return {"id": mid, "filename": row["filename"], "type": row["type"],
+                "basic": m["basic"], "exif": m["exif"], "iptc": m["iptc"], "xmp": m["xmp"]}
 
     @app.post("/api/media/delete")
     def api_media_delete(req: MediaDeleteRequest) -> dict:

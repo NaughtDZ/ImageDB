@@ -105,22 +105,39 @@
     </div>
   </section>
 
-  <!-- 最右侧：标签详情侧边栏 -->
+  <!-- 右侧边栏宽度调节条 -->
+  <div id="panel-resizer-x" class="resizer-x" title="拖动调整侧边栏宽度"></div>
+
+  <!-- 最右侧：标签详情 + 附加数据 侧边栏 -->
   <aside id="side-panel">
     <div class="side-head">
-      <span>🏷 标签</span>
+      <span>🏷 素材</span>
       <button id="btn-panel-close" class="mini-btn" title="收起侧边栏">»</button>
     </div>
     <div class="side-body">
-      <div id="panel-target-info" class="panel-info"></div>
-      <div class="form-row panel-add-row">
-        <input id="panel-tag-input" type="text" list="panel-tags-suggest"
-               placeholder="添加标签到所有选中项（回车）">
-        <datalist id="panel-tags-suggest"></datalist>
-        <button id="btn-panel-add-tag" class="btn primary">＋</button>
+      <!-- 标签分区 -->
+      <div id="panel-tags-sec" class="panel-sec">
+        <div class="panel-sec-head">🏷 标签</div>
+        <div id="panel-target-info" class="panel-info"></div>
+        <div class="form-row panel-add-row">
+          <input id="panel-tag-input" type="text" list="panel-tags-suggest"
+                 placeholder="添加标签到所有选中项（回车）">
+          <datalist id="panel-tags-suggest"></datalist>
+          <button id="btn-panel-add-tag" class="btn primary">＋</button>
+        </div>
+        <div id="panel-tags-list" class="tag-chips panel-tags"></div>
+        <div id="panel-empty" class="hint">在左侧点击缩略图或选择多个素材，这里会显示它们的标签。</div>
       </div>
-      <div id="panel-tags-list" class="tag-chips panel-tags"></div>
-      <div id="panel-empty" class="hint">在左侧点击缩略图或选择多个素材，这里会显示它们的标签。</div>
+
+      <!-- 高度调节条 -->
+      <div id="panel-resizer-y" class="resizer-y" title="拖动调整附加数据高度"></div>
+
+      <!-- 附加数据分区 -->
+      <div id="panel-meta-sec" class="panel-sec">
+        <div class="panel-sec-head">📋 附加数据 <span class="meta-note">EXIF / IPTC / XMP</span></div>
+        <div id="meta-status" class="hint">选择素材后显示 EXIF / IPTC / XMP</div>
+        <div id="meta-groups" class="meta-groups"></div>
+      </div>
     </div>
   </aside>
 </div>
@@ -376,6 +393,7 @@
 <script src="js/tagger.js"></script>
 <script src="js/tags.js"></script>
 <script src="js/panel.js"></script>
+<script src="js/metadata_panel.js"></script>
 <script src="js/folder_tags.js"></script>
 <script src="js/recycle.js"></script>
 <script src="js/settings.js"></script>

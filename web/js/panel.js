@@ -11,12 +11,19 @@
 const SidePanel = {
   /** 打开侧边栏 */
   open() {
-    document.getElementById("side-panel").classList.add("open");
+    const sp = document.getElementById("side-panel");
+    const saved = parseInt(localStorage.getItem("imagedb.panelWidth") || "260", 10);
+    sp.style.width = (isNaN(saved) ? 260 : saved) + "px";
+    sp.style.minWidth = "220px";
+    sp.classList.add("open");
   },
 
   /** 关闭侧边栏 */
   close() {
-    document.getElementById("side-panel").classList.remove("open");
+    const sp = document.getElementById("side-panel");
+    sp.classList.remove("open");
+    sp.style.width = "";
+    sp.style.minWidth = "";
   },
 
   /** 是否可见 */
@@ -29,6 +36,8 @@ const SidePanel = {
    * 在 Gallery 选择变化时调用。
    */
   async refresh() {
+    // 附加数据面板同步刷新（独立模块，独立处理，互不干扰）
+    MetadataPanel.refresh([...App.state.selected]);
     // 收集选中项的标签（并集去重）
     const sel = [...App.state.selected];
     if (sel.length === 0) {
@@ -184,6 +193,7 @@ const SidePanel = {
 
   /** 初始化事件 */
   init() {
+    MetadataPanel.init();
     document.getElementById("btn-panel-close").onclick = () => this.close();
     document.getElementById("btn-panel-add-tag").onclick = () => this.addTag();
     document.getElementById("panel-tag-input").addEventListener("keydown", (e) => {
