@@ -132,6 +132,38 @@ pip install opencv-python-headless
 - 配置：设置页 → 打标 → 「元数据/正则打标（实验）」的**规则 JSON** 编辑器；保存后插件自动重载；
 - 支持单个/多选/整个目录打标（实验版聚焦图片，视频抽帧暂不适用）；禁用可删除 `app/tagging/plugins/metadata.py` 或清空规则。
 
+## 📦 标签迁移（.imgtag 侧车）使用与兼容
+
+换盘符/挪目录时，标签随文件夹一起走，回来免 AI 重打标。
+
+### 迁移流程
+1. **导出标签**：选中单图/多图（或右键目录「整个目录树」）→ 顶栏「🏷 导出标签」→ 把各媒体标签写入其所在目录的 `.imgtag`（每目录一个 sqlite）。完成后**列出写入失败的目录**（只读盘/权限等）。
+2. **迁移自检**（可选）：顶栏「🔍 迁移自检」核对 **主库媒体 vs 磁盘 vs `.imgtag`** —— 缺 `.imgtag` 的目录 / `.imgtag` 孤儿引用 / 未覆盖的媒体；迁移前看一眼更安心。
+3. **迁移**：整目录（连同 `.imgtag`）拷贝到新位置/新盘。
+4. **导入标签**：目录重新入库后，选中该目录 → 顶栏「▼ 导入标签」→ 按文件名匹配回主库写回标签；导入对话框可勾选 **「覆盖旧导入标签」**（只动 `source=import`，不影响手动标签）。
+
+### 说明
+- 日常标签读写**始终以 `data/imagedb.sqlite` 主库为准**；`.imgtag` 只在上述显式 导出/导入 时读写。
+- `.imgtag` 按**本目录内文件名**关联（不存 media_id），故换盘符/挪目录仍能对上。
+
+### `.imgtag` 结构（标准 SQLite，可脱离软件读取）
+```sql
+CREATE TABLE IF NOT EXISTS tags (
+  filename  TEXT PRIMARY KEY,      -- 本目录内的文件名
+  tags_json TEXT NOT NULL          -- [{"name":..., "source":..., "confidence":...}]
+);
+```
+
+### 用 Python 标准库读取示例（零依赖）
+```python
+import sqlite3, json
+conn = sqlite3.connect(r"K:\path\to\folder\.imgtag")   # 换成你的目录
+for filename, tags_json in conn.execute("SELECT filename, tags_json FROM tags"):
+    tags = json.loads(tags_json)
+    print(filename, [t["name"] for t in tags])
+conn.close()
+```
+
 ## 🔌 新增/移除打标工具
 
 程序启动时自动扫描 `app/tagging/plugins/`：
