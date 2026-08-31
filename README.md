@@ -24,6 +24,13 @@
 - **附加元数据**：**EXIF**（设备/拍摄参数等）、**IPTC**（IIM：关键词/标题/作者/版权）、**XMP**（dc:subject/title/creator 等）；
 - **按需只读读取，不写数据库**：点开即从文件读取，解析失败返回空，绝不抛错（与程序解耦）；多选时默认显示第一张，结果会话内内存缓存。
 
+### 🗂 标签迁移（.imgtag 侧车）
+- 每个目录一个 **`.imgtag`**（SQLite）保存该目录内媒体文件的标签（含 `source`/`confidence`），**随文件走**，换盘符/挪目录后无需 AI 重打标；
+- **导出**：选中单图/多图或整棵目录树 → 把标签写入各目录的 `.imgtag`（不修改原图、不写主库）；
+- **导入**：读取目录树下的 `.imgtag`，按文件名匹配回主库并写回标签（`source=import`，默认不覆盖手动标签）；
+- **兼容性**：`.imgtag` 是标准 SQLite，脱离软件也可用 Python 标准库 `sqlite3` 读取；
+- **日常读写仍以 `data/imagedb.sqlite` 主库为准**；`.imgtag` 仅在显式导出/导入时使用；程序扫描目录会**自动跳过** `.imgtag`/`.txttag`。
+
 ### 🔍 多维搜索
 - 按**文件名**、**目录名**、**标签**、**类型**筛选；
 - **标签搜索支持空格/逗号/顿号分隔多个标签，默认取交集（AND）**；兼容含空格标签（如 `long hair`）；
@@ -100,6 +107,7 @@ pip install opencv-python-headless
 5. **搜索**：文件名 / 目录名 / 标签（空格分隔多标签 AND）；
 6. **维护**：顶栏「校验缺失」手动清理；后台定时自动校验；
 7. **管理**：右键目录删除记录、添加图片；选中媒体「🗑 删除选中」（仅数据库）。
+8. **迁移兼容**：选中素材或目录 →「🏷 导出标签」写入各目录 `.imgtag`；迁移后回库目录 →「▼ 导入标签」读回（免 AI 重打标）。
 
 ## 🛠 打标工具配置
 
@@ -150,6 +158,7 @@ ImageDB/
 │   ├── library.py           # 目录库：导入/进度/扫描/校验/目录树/删除
 │   ├── media.py             # 缩略图/视频抽帧/缓存清理/时长探测
 │   ├── metadata.py          # 按需读取附加数据(EXIF/IPTC/XMP)与文件基础信息（只读，不写库）
+│   ├── imagetag.py          # .imgtag 侧车：标签导出/导入迁移（每目录一个 sqlite，显式使用）
 │   ├── tagging/             # 打标子系统
 │   │   ├── base.py          # 插件基类 + 通用 ONNX 批量推理
 │   │   ├── manager.py       # 插件管理器 + 并行任务调度（GPU batch/CPU 线程池）
@@ -160,7 +169,7 @@ ImageDB/
     ├── index.html
     ├── css/style.css
     ├── favicon.svg          # 二次元风图标（大动漫眼+相册书架）
-    └── js/                  # api / app / tree / gallery / viewer / tagger / tags / panel / metadata_panel / settings
+    └── js/                  # api / app / tree / gallery / viewer / tagger / tags / panel / metadata_panel / imagetag / settings
 ```
 
 ## 🗄 数据库与缓存说明

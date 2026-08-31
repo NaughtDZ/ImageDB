@@ -51,7 +51,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import library, media as media_service, metadata as media_metadata
+from . import library, media as media_service, metadata as media_metadata, imagetag as imagetag_service
 from .config import AppConfig
 from .database import (DATA_DIR, FRAMES_DIR, THUMBS_DIR, RECYCLE_DIR, execute, execute_rowcount,
                       executemany, query_all, query_one, chunk_ids)
@@ -158,6 +158,18 @@ class TagRenameRequest(BaseModel):
 class TagDeleteRequest(BaseModel):
     """全局删除标签（应用到所有含有该标签的媒体）。"""
     name: str
+
+
+class TagExportRequest(BaseModel):
+    """导出标签到 .imgtag 侧车（迁移用）。"""
+    scope_type: str = "media"     # "media" 选中媒体 或 "folder" 整棵目录树
+    scope_ids: list[int]
+
+
+class TagImportRequest(BaseModel):
+    """从 .imgtag 侧车导入标签回主库。"""
+    folder_id: int
+    overwrite: bool = False   # 是否覆盖该来源旧标签（默认追加去重，不动手动标签）
 
 
 class MediaDeleteRequest(BaseModel):
@@ -1015,6 +1027,39 @@ def create_app(config: AppConfig) -> FastAPI:
             raise HTTPException(400, "标签名不能为空")
         removed = execute_rowcount("DELETE FROM tags WHERE name = ?", (name,))
         return {"ok": True, "removed": removed}
+
+    # ================= 标签侧车（.imgtag）导出/导入 =================
+    @app.post("/api/tags/export")
+    def api_tags_export(req: TagExportRequest) -> dict:
+        """把标签导出到各目录的 .imgtag 侧车（不写主库，不碰媒体文件）。
+
+        scope_type=media：按选中媒体导出；folder：整棵目录树每个目录各写一份。
+        """
+        if req.scope_type == "folder":
+            total = {"dirs": 0, "media": 0, "written": 0}
+            for fid in req.scope_ids:
+                r = imagetag_service.export_folder(fid)
+                for k in total:
+                    total[k] += r[k]
+            return total
+        if req.scope_type == "media":
+            if not req.scope_ids:
+                raise HTTPException(400, "未指定媒体")
+            rows: list[dict] = []
+            for chunk in chunk_ids(req.scope_ids):
+                ph = ",".join("?" * len(chunk))
+                rows.extend(query_all(
+                    f"SELECT id, path, filename FROM media_items WHERE id IN ({ph})", chunk))
+            return imagetag_service.export_media(rows)
+        raise HTTPException(400, "scope_type 必须为 media 或 folder")
+
+    @app.post("/api/tags/import")
+    def api_tags_import(req: TagImportRequest) -> dict:
+        """从目录的 .imgtag 侧车导入标签回主库（source=import，可选覆盖）。
+
+        按文件名匹配回库内媒体；数据仍以主库为准，.imgtag 仅供参考/迁移。
+        """
+        return imagetag_service.import_folder(req.folder_id, req.overwrite)
 
     # ================= 打标 =================
     @app.get("/api/tagging/tools")

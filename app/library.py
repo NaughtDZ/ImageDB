@@ -20,6 +20,7 @@ import logging
 import os
 
 from .database import delete, execute, executemany, query_all, query_one
+from .imagetag import is_sidecar
 
 logger = logging.getLogger("imagedb.library")
 
@@ -81,6 +82,8 @@ def _walk_and_insert(dir_path: str, parent_db_id: int, seen: set[str]) -> tuple[
     media_rows: list[tuple] = []
     subdirs: list[os.DirEntry] = []
     for entry in entries:
+        if is_sidecar(entry.name):
+            continue   # 跳过 .imgtag / .txttag 等标签侧车
         try:
             if entry.is_dir(follow_symlinks=False):
                 subdirs.append(entry)
@@ -136,6 +139,8 @@ def count_media_files(root_path: str) -> tuple[int, int]:
         try:
             with os.scandir(dir_path) as it:
                 for entry in it:
+                    if is_sidecar(entry.name):
+                        continue   # 跳过 .imgtag / .txttag
                     try:
                         if entry.is_dir(follow_symlinks=False):
                             dirs += 1
@@ -156,6 +161,8 @@ def count_media_files(root_path: str) -> tuple[int, int]:
         try:
             with os.scandir(cur) as it:
                 for entry in it:
+                    if is_sidecar(entry.name):
+                        continue   # 跳过 .imgtag / .txttag
                     try:
                         if entry.is_dir(follow_symlinks=False):
                             real = os.path.realpath(entry.path)

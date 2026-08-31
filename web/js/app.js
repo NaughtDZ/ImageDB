@@ -71,6 +71,8 @@ const App = {
     document.getElementById("btn-tag").onclick = () => Tagger.open();
     document.getElementById("btn-view").onclick = () => this.openViewer();
     document.getElementById("btn-manual-tags").onclick = () => TagsEditor.open();
+    document.getElementById("btn-export-tags").onclick = () => Imagetag.exportTags();
+    document.getElementById("btn-import-tags").onclick = () => Imagetag.importTags();
     document.getElementById("btn-clear-sel").onclick = () => Gallery.clearSelection();
     document.getElementById("btn-delete-sel").onclick = () => this.deleteSelected();
     document.getElementById("btn-trash-sel").onclick = () => this.trashSelected();
