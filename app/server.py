@@ -1036,11 +1036,12 @@ def create_app(config: AppConfig) -> FastAPI:
         scope_type=media：按选中媒体导出；folder：整棵目录树每个目录各写一份。
         """
         if req.scope_type == "folder":
-            total = {"dirs": 0, "media": 0, "written": 0}
+            total = {"dirs": 0, "media": 0, "written": 0, "failed": []}
             for fid in req.scope_ids:
                 r = imagetag_service.export_folder(fid)
-                for k in total:
+                for k in ("dirs", "media", "written"):
                     total[k] += r[k]
+                total["failed"].extend(r.get("failed", []))
             return total
         if req.scope_type == "media":
             if not req.scope_ids:
@@ -1060,6 +1061,11 @@ def create_app(config: AppConfig) -> FastAPI:
         按文件名匹配回库内媒体；数据仍以主库为准，.imgtag 仅供参考/迁移。
         """
         return imagetag_service.import_folder(req.folder_id, req.overwrite)
+
+    @app.post("/api/tags/selfcheck")
+    def api_tags_selfcheck(req: FolderIdRequest) -> dict:
+        """迁移前自检：目录树内 .imgtag 与磁盘/主库三方一致性（缺 .imgtag / 孤儿引用 / 未覆盖）。"""
+        return imagetag_service.self_check(req.folder_id)
 
     # ================= 打标 =================
     @app.get("/api/tagging/tools")

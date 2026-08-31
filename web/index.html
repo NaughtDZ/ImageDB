@@ -88,6 +88,7 @@
         <button id="btn-manual-tags" class="btn" title="手动添加/移除标签">✎ 标签</button>
         <button id="btn-export-tags" class="btn" title="把标签导出到各目录的 .imgtag（迁移用）">🏷 导出标签</button>
         <button id="btn-import-tags" class="btn" title="从 .imgtag 把标签导入回主库">▼ 导入标签</button>
+        <button id="btn-selfcheck-tags" class="btn" title="迁移前自检：核对 .imgtag 与磁盘/主库">🔍 迁移自检</button>
         <button id="btn-delete-sel" class="btn" title="从数据库中删除选中项（不删除磁盘文件）">🗑 删除选中</button>
         <button id="btn-trash-sel" class="btn" title="把选中文件移到回收站（需输入 yes 确认）">♻ 移到回收站</button>
         <button id="btn-move-sel" class="btn" title="把选中文件移动到其他目录（需输入 yes 确认）">📁 移动</button>
@@ -382,6 +383,33 @@
       <button id="prompt-cancel" class="btn">取消</button>
       <button id="prompt-ok" class="btn primary">确定</button>
     </div>
+  </div>
+</div>
+
+<!-- ========== 标签侧车：导入确认对话框 ========== -->
+<div id="imagetag-import-modal" class="modal hidden">
+  <div class="dialog">
+    <div class="dialog-head">▼ 导入标签（.imgtag）<button class="btn close" data-close="imagetag-import-modal">✕</button></div>
+    <div class="dialog-body">
+      <div id="imagetag-import-info" class="msg" style="margin-bottom:10px"></div>
+      <div class="form-row"><label><input type="checkbox" id="imagetag-import-overwrite"> 覆盖旧导入标签（source=import，不影响手动标签）</label></div>
+      <div class="hint" style="margin-top:0">从当前目录树下的 .imgtag 读取标签，按文件名匹配回主库。默认追加去重、不动手动标签；勾选“覆盖”则先清掉该媒体旧的 source=import 标签再写入。</div>
+    </div>
+    <div class="dialog-foot">
+      <button id="imagetag-import-cancel" class="btn">取消</button>
+      <button id="imagetag-import-go" class="btn primary">导入</button>
+    </div>
+  </div>
+</div>
+
+<!-- ========== 标签侧车：结果 / 自检报告 ========== -->
+<div id="imagetag-log-modal" class="modal hidden">
+  <div class="dialog wide">
+    <div class="dialog-head"><span id="imagetag-log-title">结果</span><button class="btn close" data-close="imagetag-log-modal">✕</button></div>
+    <div class="dialog-body">
+      <div id="imagetag-log" class="imagetag-log"></div>
+    </div>
+    <div class="dialog-foot"><button class="btn" data-close="imagetag-log-modal">关闭</button></div>
   </div>
 </div>
 

@@ -37,6 +37,7 @@ const App = {
     Gallery.initThumbSlider();
     // 初始化右侧标签侧边栏
     SidePanel.init();
+    Imagetag.init();
     // 初始化目录标签管理
     FolderTags.init();
     Recycle.init();
@@ -73,6 +74,7 @@ const App = {
     document.getElementById("btn-manual-tags").onclick = () => TagsEditor.open();
     document.getElementById("btn-export-tags").onclick = () => Imagetag.exportTags();
     document.getElementById("btn-import-tags").onclick = () => Imagetag.importTags();
+    document.getElementById("btn-selfcheck-tags").onclick = () => Imagetag.selfCheck();
     document.getElementById("btn-clear-sel").onclick = () => Gallery.clearSelection();
     document.getElementById("btn-delete-sel").onclick = () => this.deleteSelected();
     document.getElementById("btn-trash-sel").onclick = () => this.trashSelected();

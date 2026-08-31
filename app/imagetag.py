@@ -45,15 +45,15 @@ def _open(directory: str) -> sqlite3.Connection:
 
 
 # ---------------- 读写侧车 ----------------
-def write_tags(directory: str, tags_by_filename: dict, rebuild: bool = False) -> int:
+def write_tags(directory: str, tags_by_filename: dict, rebuild: bool = False) -> dict:
     """把 {filename: [ {name,source,confidence} ]} 写入 directory/.imgtag（合并）。
 
     rebuild=True 时先清空该目录 .imgtag 再写（整目录重建，用于文件夹导出同步到当前库）。
-    返回写入的文件数；失败返回 0（不抛错）。
+    返回 {"written": 写入文件数, "error": 失败原因或 None}（失败不抛错）。
     """
     entries = tags_by_filename or {}
     if not entries:
-        return 0
+        return {"written": 0, "error": None}
     try:
         conn = _open(directory)
         try:
@@ -67,8 +67,8 @@ def write_tags(directory: str, tags_by_filename: dict, rebuild: bool = False) ->
             conn.close()
     except Exception as exc:  # noqa: BLE001
         logger.warning("写入 .imgtag 失败 %s：%s", directory, exc)
-        return 0
-    return len(entries)
+        return {"written": 0, "error": str(exc)}
+    return {"written": len(entries), "error": None}
 
 
 def read_tags(directory: str) -> dict:
@@ -159,35 +159,42 @@ def _subtree_folders(folder_id: int) -> list[dict]:
 # ---------------- 导出 ----------------
 def export_media(media_rows: list[dict]) -> dict:
     """按选中的媒体（单图/多图）导出：把它们的 tags 写入各自目录的 .imgtag（合并）。
-    media_rows: [{id, path, filename}, ...]。返回统计。"""
+    media_rows: [{id, path, filename}, ...]。返回统计（含 failed 目录清单）。"""
     ids = [r["id"] for r in media_rows]
     tmap = _fetch_tags(ids)
     by_dir: dict[str, dict] = {}
     for r in media_rows:
         d = os.path.dirname(r["path"]) or os.getcwd()
         by_dir.setdefault(d, {})[r["filename"]] = tmap.get(r["id"], [])
-    n = 0
+    failed: list[dict] = []
+    written = 0
     for d, entries in by_dir.items():
-        n += write_tags(d, entries, rebuild=False)
-    return {"dirs": len(by_dir), "media": len(media_rows), "written": n}
+        res = write_tags(d, entries, rebuild=False)
+        written += res["written"]
+        if res["error"]:
+            failed.append({"dir": d, "error": res["error"]})
+    return {"dirs": len(by_dir), "media": len(media_rows), "written": written, "failed": failed}
 
 
 def export_folder(folder_id: int) -> dict:
-    """导出整棵目录树：每个目录写一份 .imgtag（整目录重建为当前库状态）。返回统计。"""
+    """导出整棵目录树：每个目录写一份 .imgtag（整目录重建为当前库状态）。返回统计（含 failed）。"""
     dirs = 0
     media = 0
     written = 0
+    failed: list[dict] = []
     for f in _subtree_folders(folder_id):
         rows = query_all("SELECT id, filename FROM media_items WHERE folder_id = ?", (f["id"],))
         if not rows:
             continue
         tmap = _fetch_tags([r["id"] for r in rows])
         entries = {r["filename"]: tmap.get(r["id"], []) for r in rows}
-        w = write_tags(f["path"], entries, rebuild=True)
+        res = write_tags(f["path"], entries, rebuild=True)
         dirs += 1
         media += len(rows)
-        written += w
-    return {"dirs": dirs, "media": media, "written": written}
+        written += res["written"]
+        if res["error"]:
+            failed.append({"dir": f["path"], "error": res["error"]})
+    return {"dirs": dirs, "media": media, "written": written, "failed": failed}
 
 
 # ---------------- 导入 ----------------
@@ -214,3 +221,60 @@ def import_folder(folder_id: int, overwrite: bool = False) -> dict:
             media_hit += 1
             tags_added += _write_tags(mid, tags, "import", overwrite)
     return {"media": media_hit, "tags": tags_added, "files": files}
+
+# ---------------- 迁移自检 ----------------
+def _check_dir_sidecar(path: str, media_filenames: list[str]) -> dict:
+    """单目录自检：返回该目录 .imgtag 与磁盘/主库媒体的一致性报告。"""
+    side = read_tags(path)
+    disk: set = set()
+    try:
+        disk = {e.name for e in os.scandir(path) if e.is_file(follow_symlinks=False)}
+    except OSError:
+        pass
+    report = {"path": path, "missing": False, "orphan_refs": [], "uncovered": []}
+    if not side:
+        # 无 .imgtag：目录里所有在库媒体都未覆盖
+        report["missing"] = True
+        report["uncovered"] = [os.path.join(path, fn) for fn in media_filenames]
+        return report
+    side_set = set(side.keys())
+    report["orphan_refs"] = [os.path.join(path, fn) for fn in (side_set - disk)]
+    report["uncovered"] = [os.path.join(path, fn) for fn in (set(media_filenames) - side_set)]
+    return report
+
+
+def self_check(folder_id: int) -> dict:
+    """迁移前自检：目录树内「主库媒体 vs 磁盘 vs .imgtag」的一致性。
+
+    返回：
+        missing_imgtag : 有媒体但缺 .imgtag 的目录
+        orphan_refs    : .imgtag 里引用但磁盘上不存在的文件（已截断到前 200）
+        uncovered      : 主库/磁盘有媒体但 .imgtag 未覆盖的文件（已截断到前 200）
+    """
+    dirs = 0
+    media = 0
+    missing_imgtag: list[str] = []
+    orphan_refs: list[str] = []
+    uncovered: list[str] = []
+    for f in _subtree_folders(folder_id):
+        rows = query_all("SELECT id, filename FROM media_items WHERE folder_id = ?", (f["id"],))
+        if not rows:
+            continue
+        dirs += 1
+        media += len(rows)
+        rep = _check_dir_sidecar(f["path"], [r["filename"] for r in rows])
+        if rep["missing"]:
+            missing_imgtag.append(rep["path"])
+        orphan_refs.extend(rep["orphan_refs"])
+        uncovered.extend(rep["uncovered"])
+    # 超限截断，避免前端爆
+    return {
+        "dirs": dirs,
+        "media": media,
+        "missing_imgtag": missing_imgtag,
+        "orphan_refs": orphan_refs[:200],
+        "uncovered": uncovered[:200],
+        "orphan_total": len(orphan_refs),
+        "uncovered_total": len(uncovered),
+    }
+
