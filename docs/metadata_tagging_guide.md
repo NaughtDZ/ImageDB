@@ -2,6 +2,7 @@
 
 > 适用版本：ImageDB 1.0 · 功能「元数据/正则打标（实验）」
 > 本功能**不需要 AI 模型**、不用下载模型、无需显卡。它靠你写的**正则规则**，直接从 **文件名** 或 **文件的附加元数据（EXIF/IPTC/XMP）** 里把标签抓出来。
+> 想让 AI 帮你生成提取规则？见 [`docs/metadata_tagging_prompt.md`](docs/metadata_tagging_prompt.md)。
 
 ---
 
