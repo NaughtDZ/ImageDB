@@ -44,6 +44,7 @@
 | <code>flags</code> | 否 | 正则选项 | 可组合 <code>i</code>(忽略大小写)、<code>m</code>(多行)、<code>s</code>(点匹配换行)，如 <code>"im"</code> |
 | <code>tag</code> | 否 | 标签模板 | 支持 <code>{match}</code>、<code>$1</code>..<code>$9</code>、<code>{name}</code>，默认 <code>{match}</code> |
 | <code>normalize</code> | 否 | 大小写归一 | <code>"lower"</code> / <code>"upper"</code> / 空 |
+| <code>split</code> | 否 | 命中后把标签按该分隔符拆成多个 | 如 <code>"_"</code>、<code>","</code>（正则） |
 
 **标签模板里能写：**
 - <code>{match}</code>（整段匹配到的文本）
@@ -83,6 +84,15 @@
         "pattern": "(long hair|solo|nude)",
         "tag": "$1",
         "flags": "i"
+      },
+      {
+        "enabled": true,
+        "name": "[tag] 后的下划线标签批量导入",
+        "source": "filename",
+        "pattern": "\\[tag\\]_(.+?)(?:\\.[a-z0-9]+)?$",
+        "tag": "$1",
+        "split": "_",
+        "normalize": "lower"
       }
     ]
 
@@ -106,6 +116,13 @@
 ### 例3：文件名出现关键词就加标签
 - 用 <code>|</code>（或）列举关键词，命中即加
 - <code>flags:"i"</code> 忽略大小写，<code>Long Hair</code> / <code>long hair</code> 都能命中
+
+### 例4：把 <code>[tag]</code> 后面用下划线分隔的多个标签批量导入
+文件名形如 <code>Recent Stuff_149092984_p21_[tag]_R-18_Koikatsu_きのこ_エジプト娘_猫耳_モンスター娘_巨乳_褐色ちゃん_蛾_アヌビス_AhaNubis.jpg</code>：
+- <code>pattern</code>=<code>\\[tag\\]_(.+?)(?:\\.[a-z0-9]+)?$</code>：定位到 <code>[tag]</code> 之后，把到扩展名之前的内容整体抓进 <code>$1</code>；
+- <code>split:"_"</code>：再把 <code>$1</code> 用下划线拆成一个个标签（如 <code>R-18</code>、<code>Koikatsu</code>、<code>猫耳</code>……）；
+- <code>normalize:"lower"</code> 可选，把标签统一小写。
+- 例：上面的文件名会得到 <code>r-18</code>、<code>koikatsu</code>、<code>猫耳</code>…（拆出多少个就多少个）。
 
 ---
 

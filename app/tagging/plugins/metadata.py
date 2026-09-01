@@ -13,6 +13,7 @@ r"""
       - flags     : 可选 i / m / s（忽略大小写 / 多行 / 点匹配换行）
       - tag       : 标签模板，支持 {match}（整体匹配）、$1..$9（捕获组）、{name}
       - normalize : 可选 lower / upper
+      - split     : 可选分隔符（正则）。命中后把渲染出的标签按它拆成多个，用于「文件名里 _ 分隔的多个 tag」
 
 用途示例：
     - 从文件名提取：      pattern="^(.*?)[_-](\d+)$",  tag="$1"
@@ -77,7 +78,7 @@ class MetadataTaggerPlugin(TaggerPlugin):
         cfg = dict(self.config)
         cfg.setdefault("rules", [])
         cfg["hint"] = ("规则存于本工具配置的 rules 里：source=filename/metadata/all，"
-                       "pattern=正则，tag 模板可用 {match}、$1、{name}。")
+                       "pattern=正则，tag 模板可用 {match}、$1、{name}；split=可选分隔符，把结果拆成多个标签。")
         return cfg
 
     # ---- 核心打标 ----
@@ -96,6 +97,7 @@ class MetadataTaggerPlugin(TaggerPlugin):
                     "re": re.compile(pattern, _flags_from(r.get("flags", ""))),
                     "tag": r.get("tag", "{match}"),
                     "normalize": (r.get("normalize") or "").lower(),
+                    "split": (r.get("split") or ""),   # 可选：命中后把标签按该分隔符拆成多个
                 })
             except re.error as exc:
                 logger.warning("规则「%s」正则错误：%s", r.get("name", ""), exc)
@@ -130,7 +132,15 @@ class MetadataTaggerPlugin(TaggerPlugin):
                     tag = tag.upper()
                 tag = (tag or "").strip()
                 if tag:
-                    found.setdefault(tag, 1.0)   # 规则标签置信度 1.0
+                    sep = c.get("split") or ""
+                    if sep:
+                        # split 为分隔符（正则）：把渲染结果拆成多个标签，如 "[tag] 后 _ 分隔的多个 tag"
+                        for sub in re.split(sep, tag):
+                            sub = (sub or "").strip()
+                            if sub:
+                                found.setdefault(sub, 1.0)
+                    else:
+                        found.setdefault(tag, 1.0)   # 规则标签置信度 1.0
                 break   # 每条规则对一个候选命中取一条即可
         return [TagResult(tag=t, confidence=c) for t, c in found.items()]
 
