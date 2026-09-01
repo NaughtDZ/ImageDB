@@ -131,6 +131,7 @@ pip install opencv-python-headless
 - 规则字段：`enabled / name / source(filename|metadata|all) / pattern / flags(i,m,s) / tag(模板：{match}、$1..$9、{name}) / normalize(lower|upper)`；
 - 配置：设置页 → 打标 → 「元数据/正则打标（实验）」的**规则 JSON** 编辑器；保存后插件自动重载；
 - 支持单个/多选/整个目录打标（实验版聚焦图片，视频抽帧暂不适用）；禁用可删除 `app/tagging/plugins/metadata.py` 或清空规则。
+- 📖 **详细零基础图文教程**见 [`docs/metadata_tagging_guide.md`](docs/metadata_tagging_guide.md)。
 
 ## 📦 标签迁移（.imgtag 侧车）使用与兼容
 
