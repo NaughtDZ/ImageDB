@@ -470,6 +470,12 @@ body.selecting { user-select: none; cursor: crosshair; }
 }
 #btn-only-missing .cnt:empty { display: none; }
 #btn-only-missing.active .cnt { background: rgba(0, 0, 0, .28); }
+/* ---------- 设置页「关于 / 版本」 ---------- */
+.about-info { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.about-info .about-row { display: flex; gap: 10px; }
+.about-info .about-row .k { color: var(--text-dim); width: 130px; flex-shrink: 0; text-align: right; }
+.about-info .about-row .v { color: var(--text); word-break: break-all; }
+
 
 .tree-node .count .miss { color: var(--danger); }
 

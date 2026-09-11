@@ -52,6 +52,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import library, media as media_service, metadata as media_metadata, imagetag as imagetag_service
+from . import version as app_version
 from .config import AppConfig
 from .database import (DATA_DIR, FRAMES_DIR, THUMBS_DIR, RECYCLE_DIR, execute, execute_rowcount,
                       executemany, query_all, query_one, chunk_ids)
@@ -446,6 +447,9 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        _vi = app_version.info()
+        logger.info("ImageDB %s 启动 | 代码时间=%s | 进程启动=%s",
+                    app_version.short_label(), _vi.get("code_mtime"), _vi.get("started_at"))
         # 启动：初始化打标插件管理器
         tagging_manager.init_manager(lambda: config)
         # 启动后台校验线程（只把外部丢失的媒体标记为 missing，绝不删记录）
@@ -1147,7 +1151,23 @@ def create_app(config: AppConfig) -> FastAPI:
             mgr.reload()
         return {"ok": True}
 
-    # ================= 设置 / 下载 =================
+    # ================= 版本 / 设置 / 下载 =================
+    @app.get("/api/version")
+    def api_version() -> dict:
+        """运行版本信息：应用版本 / 代码 commit / 启动时间 / 库统计。
+
+        用途：一眼确认「当前跑的进程是不是最新代码」（改了代码但没重启时最容易踩坑）。
+        """
+        v = app_version.info()
+        try:
+            v["media_total"] = query_one("SELECT COUNT(1) AS c FROM media_items")["c"]
+            v["missing_total"] = query_one(
+                "SELECT COUNT(1) AS c FROM media_items WHERE status = 'missing'")["c"]
+            v["db_path"] = os.path.join(DATA_DIR, "imagedb.sqlite")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取库统计失败：%s", exc)
+        return v
+
     @app.get("/api/settings")
     def api_get_settings() -> dict:
         """读取全部设置（工具配置展开为 JSON 对象）。"""

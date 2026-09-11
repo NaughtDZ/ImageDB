@@ -266,6 +266,7 @@
         <button class="tab" data-tab="download">模型下载</button>
         <button class="tab" data-tab="deps">依赖更新</button>
         <button class="tab" data-tab="tasks">任务</button>
+        <button class="tab" data-tab="about">关于</button>
       </div>
 
       <!-- 代理 -->
@@ -353,6 +354,15 @@
       <div class="tab-pane" id="tab-tasks">
         <button id="btn-refresh-jobs" class="btn">刷新任务列表</button>
         <div id="jobs-list" class="jobs-list"></div>
+      </div>
+
+      <!-- 关于（版本 / 启动时间） -->
+      <div class="tab-pane" id="tab-about">
+        <div class="form-row"><button id="btn-refresh-about" class="btn">↻ 刷新</button>
+          <span id="about-verdict" class="msg"></span></div>
+        <div id="about-info" class="about-info"></div>
+        <div class="hint">「代码版本」与「代码时间」用于确认当前进程跑的是不是最新代码：<br>
+          改了代码后必须<b>重启程序</b>（刷新网页只更新前端，不会重载 Python 后端）。</div>
       </div>
     </div>
     <div class="dialog-foot">

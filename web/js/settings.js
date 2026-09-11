@@ -30,6 +30,7 @@ const Settings = {
       this.fillTokenForm();
       this.renderToolConfigs();
       this.refreshJobs();
+      this.fillAbout();
     } catch (e) {
       toast("读取设置失败：" + e.message, "err");
     }
@@ -293,6 +294,64 @@ const Settings = {
     }
   },
 
+  // ---------------- 关于 / 版本 ----------------
+  _uptime(sec) {
+    sec = Math.max(0, parseInt(sec || 0, 10));
+    const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600);
+    const m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    if (d) return d + " 天 " + h + " 小时";
+    if (h) return h + " 小时 " + m + " 分";
+    if (m) return m + " 分 " + s + " 秒";
+    return s + " 秒";
+  },
+
+  _ts(str) {
+    if (!str) return NaN;
+    return new Date(String(str).replace(/-/g, "/")).getTime();
+  },
+
+  /** 读取并渲染运行版本信息（判断当前进程是否最新代码） */
+  async fillAbout() {
+    const box = document.getElementById("about-info");
+    const verdict = document.getElementById("about-verdict");
+    if (!box) return;
+    box.innerHTML = '<div class="hint">读取中…</div>';
+    if (verdict) { verdict.textContent = ""; verdict.className = "msg"; }
+    try {
+      const v = await API.get("/api/version");
+      const rows = [
+        ["应用版本", v.version],
+        ["代码版本 (commit)", v.commit_short || "（非 git 检出）"],
+        ["代码时间", v.code_mtime || "-"],
+        ["commit 时间", v.commit_time || "-"],
+        ["本次进程启动", v.started_at],
+        ["已运行", this._uptime(v.uptime_sec)],
+        ["Python", v.python],
+        ["系统", v.platform],
+        ["程序目录", v.base_dir],
+        ["数据库", v.db_path || "-"],
+        ["媒体总数", v.media_total],
+        ["丢失标记数", v.missing_total],
+      ];
+      box.innerHTML = rows.map(([k, val]) =>
+        '<div class="about-row"><span class="k">' + escapeHtml(String(k)) + "</span>" +
+        '<span class="v">' + escapeHtml(String(val === undefined || val === null ? "-" : val)) + "</span></div>",
+      ).join("");
+      if (verdict) {
+        const cm = this._ts(v.code_mtime), st = this._ts(v.started_at);
+        if (!isNaN(cm) && !isNaN(st) && cm > st) {
+          verdict.textContent = "⚠ 代码比进程新 —— 请重启程序以加载最新代码";
+          verdict.className = "msg err";
+        } else {
+          verdict.textContent = "✅ 当前进程已是最新代码";
+          verdict.className = "msg ok";
+        }
+      }
+    } catch (e) {
+      box.innerHTML = '<div class="hint">读取失败：' + escapeHtml(e.message) + "</div>";
+    }
+  },
+
   // ---------------- 任务列表 ----------------
   async refreshJobs() {
     const box = document.getElementById("jobs-list");
@@ -339,6 +398,7 @@ const Settings = {
       inp.type = inp.type === "password" ? "text" : "password";
     };
     document.getElementById("btn-refresh-jobs").onclick = () => this.refreshJobs();
+    document.getElementById("btn-refresh-about").onclick = () => this.fillAbout();
     document.querySelectorAll("[data-close='settings-modal']").forEach(el => {
       el.onclick = () => document.getElementById("settings-modal").classList.add("hidden");
     });
