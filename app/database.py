@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS media_items (
 CREATE INDEX IF NOT EXISTS idx_media_folder ON media_items(folder_id);
 CREATE INDEX IF NOT EXISTS idx_media_type ON media_items(type);
 CREATE INDEX IF NOT EXISTS idx_media_filename ON media_items(filename);
+-- status 索引：目录树/「只看丢失」筛选用 WHERE status='missing'，无索引会全表扫（37 万行 ~160ms）
+CREATE INDEX IF NOT EXISTS idx_media_status ON media_items(status);
 
 -- 标签表
 CREATE TABLE IF NOT EXISTS tags (
