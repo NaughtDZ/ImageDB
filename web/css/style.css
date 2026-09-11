@@ -461,6 +461,7 @@ body.selecting { user-select: none; cursor: crosshair; }
   font-size: 11px; padding: 2px 6px; border-radius: 4px;
 }
 .tree-node.missing .label { color: var(--danger); }
+.tree-node.offline .label { color: var(--text-dim); font-style: italic; }
 .tree-node .count .miss { color: var(--danger); }
 
 

@@ -373,6 +373,49 @@ def _subtree_folder_ids(root_id: int) -> list[int]:
     return [r["id"] for r in rows]
 
 
+def _root_of(folder_id: int) -> int | None:
+    """沿 parent_id 上溯到根目录（is_root=1）的 id；无根祖先返回 None。"""
+    cur: int | None = folder_id
+    seen: set[int] = set()
+    while cur is not None and cur not in seen:
+        seen.add(cur)
+        row = query_one("SELECT id, parent_id, is_root FROM folders WHERE id = ?", (cur,))
+        if row is None:
+            return None
+        if row["is_root"]:
+            return row["id"]
+        cur = row["parent_id"]
+    return None
+
+
+def _folder_root_map() -> tuple[dict[int, int | None], dict[int, str]]:
+    """一次查库得到 ({folder_id: root_id}, {folder_id: path})，供全库校验用。"""
+    rows = query_all("SELECT id, parent_id, is_root, path FROM folders")
+    parent = {r["id"]: r["parent_id"] for r in rows}
+    isroot = {r["id"]: bool(r["is_root"]) for r in rows}
+    paths = {r["id"]: r["path"] for r in rows}
+    out: dict[int, int | None] = {}
+    for fid in parent:
+        cur: int | None = fid
+        seen: set[int] = set()
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            if isroot.get(cur):
+                break
+            cur = parent.get(cur)
+        out[fid] = cur
+    return out, paths
+
+
+def root_offline(root_id: int) -> bool:
+    """根目录是否不可达（盘没挂/被拔/目录被删）→ 视为「离线」，此时不做丢失标记。
+
+    这样把「盘没挂」与「文件真被删」区分开，避免拔盘就把整库标成 missing。
+    """
+    row = query_one("SELECT path FROM folders WHERE id = ?", (root_id,))
+    return bool(row) and not os.path.isdir(row["path"])
+
+
 def _count_media_in(folder_ids: list[int]) -> int:
     """统计若干目录下的媒体数量。"""
     if not folder_ids:
@@ -431,9 +474,15 @@ def rescan_folder(folder_id: int) -> dict:
     folder = query_one("SELECT * FROM folders WHERE id = ?", (folder_id,))
     if not folder:
         raise ValueError(f"目录 id 不存在：{folder_id}")
+    # 根目录不可达（盘没挂/被拔）→ 视为「离线」，不做任何标记
+    rid = _root_of(folder_id)
+    if rid is not None and root_offline(rid):
+        return {"added": 0, "missing": 0, "recovered": 0,
+                "dir_missing": True, "root_offline": True}
     if not os.path.isdir(folder["path"]):
         missing = _mark_all_missing(_subtree_folder_ids(folder_id))
-        return {"added": 0, "missing": missing, "recovered": 0, "dir_missing": True}
+        return {"added": 0, "missing": missing, "recovered": 0,
+                "dir_missing": True, "root_offline": False}
 
     # 1. 补录磁盘上新增的目录与媒体
     seen: set[str] = {os.path.realpath(folder["path"])}
@@ -453,7 +502,8 @@ def rescan_folder(folder_id: int) -> dict:
         missing += m
         recovered += o
 
-    return {"added": added, "missing": missing, "recovered": recovered, "dir_missing": False}
+    return {"added": added, "missing": missing, "recovered": recovered,
+            "dir_missing": False, "root_offline": False}
 
 
 def purge_missing(folder_id: int) -> dict:
@@ -485,35 +535,52 @@ def purge_missing(folder_id: int) -> dict:
 
 
 def verify_all() -> dict:
-    """全库校验（**只标记、不删除**）：磁盘上不存在的媒体 → status='missing'；
-    重新出现的 → 标回 'ok'。**绝不删除任何数据库记录**（清理须用户显式确认）。
-    由后台校验线程与「扫描丢失」按钮调用。返回 {missing, recovered, dirs_missing}。
+    """全库扫描（**只标记、不删除**）：磁盘上已不存在的媒体 → status='missing'；
+    重新出现的 → 标回 'ok'。**绝不删除任何数据库记录**。
+
+    根目录不可达（盘没挂/被拔）时**整棵跳过**，只记入 offline_roots——
+    避免「拔盘 → 几十万条被误标丢失」。
+    返回 {missing, recovered, dirs_missing, offline_roots}。
     """
+    rmap, paths = _folder_root_map()
+    reach: dict[int, bool] = {}
+    for rid in {v for v in rmap.values() if v is not None}:
+        reach[rid] = os.path.isdir(paths.get(rid, ""))
+    offline_roots = [paths[r] for r, ok in reach.items() if not ok]
+
     missing = 0
     recovered = 0
     dirs_missing = 0
-    for f in query_all("SELECT id, path FROM folders"):
-        if not os.path.isdir(f["path"]):
+    for fid, rid in rmap.items():
+        if rid is not None and not reach.get(rid, True):
+            continue   # 所在根离线 → 不标记
+        p = paths.get(fid, "")
+        if not os.path.isdir(p):
             dirs_missing += 1
-            missing += _mark_all_missing([f["id"]])
+            missing += _mark_all_missing([fid])
             continue
-        m, o = _sync_dir_status(f["id"], f["path"])
+        m, o = _sync_dir_status(fid, p)
         missing += m
         recovered += o
-    return {"missing": missing, "recovered": recovered, "dirs_missing": dirs_missing}
+    return {"missing": missing, "recovered": recovered,
+            "dirs_missing": dirs_missing, "offline_roots": offline_roots}
 
 
 def check_folder(folder_id: int) -> dict:
     """校验单个目录（用户点击树节点时调用）：
-    目录已不存在 → 只把其下媒体标记 missing 并返回 exists=False（**绝不删记录**）。
+    - 所在根目录不可达 → 视为「离线」，不标记、只返回 root_offline=True；
+    - 目录本身不存在（根可达）→ 只把其下媒体标记 missing（**绝不删记录**）。
     """
     folder = query_one("SELECT * FROM folders WHERE id = ?", (folder_id,))
     if not folder:
-        return {"exists": False, "missing": 0}
+        return {"exists": False, "missing": 0, "root_offline": False}
+    rid = _root_of(folder_id)
+    if rid is not None and root_offline(rid):
+        return {"exists": False, "missing": 0, "root_offline": True}
     if not os.path.isdir(folder["path"]):
         n = _mark_all_missing(_subtree_folder_ids(folder_id))
-        return {"exists": False, "missing": n}
-    return {"exists": True, "missing": 0}
+        return {"exists": False, "missing": n, "root_offline": False}
+    return {"exists": True, "missing": 0, "root_offline": False}
 
 def remove_folder(folder_id: int) -> int:
     """
@@ -582,6 +649,8 @@ def build_tree() -> dict:
             "missing": not os.path.isdir(f["path"]),
             # 该目录下被标记为丢失的媒体数
             "missing_count": miss_map.get(f["id"], 0),
+            # 所在根目录是否不可达（盘没挂/被拔）→ 由下面 walk 覆盖
+            "offline": False,
         }
 
     roots: list[dict] = []
@@ -592,8 +661,21 @@ def build_tree() -> dict:
         else:
             roots.append(node)
 
+    # 逐个根判断可达性并向下传播：根不可达 = 整棵「离线」（盘没挂），
+    # 此时不显示为「丢失」（避免拔盘就把整库标成缺失）。
+    def _walk(node: dict, offline: bool) -> None:
+        node["offline"] = offline
+        node["missing"] = (not offline) and (not os.path.isdir(node["path"]))
+        for ch in node["children"]:
+            _walk(ch, offline)
+
+    for r in roots:
+        _walk(r, offline=not os.path.isdir(r["path"]))
+
     return {
         "tree": roots,
         "total_folders": len(folders),
         "total_media": sum(count_map.values()),
+        "missing_total": sum(miss_map.values()),
+        "offline_roots": [r["path"] for r in roots if r["offline"]],
     }

@@ -306,8 +306,11 @@
           <div class="hint">0 = 不限制；超限时自动清理最久未访问的缩略图（LRU）。
             默认 200MB ≈ 数千张缩略图，比 1GB 更合理。首次点击素材时生成缩略图，
             生成过就保留，翻回已访问页会从缓存快速读取。</div>
-        <div class="form-row"><label>后台缺失校验间隔（秒，0=关闭）</label>
-          <input id="set-verify-interval" type="number" min="0" value="60"></div>
+        <div class="form-row"><label>后台自动标记丢失间隔（秒，0=关闭）</label>
+          <input id="set-verify-interval" type="number" min="0" value="0"></div>
+        <div class="hint">默认 <b>0（关闭）</b>：定时全量重扫对网络盘/大库开销很大。<br>
+          日常靠<b>浏览时按需检测</b>（翻到哪张就检查哪张）+ 手动「🔎 扫描丢失」/右键「重新扫描」。<br>
+          想要自动发现可设为 600~1800（10~30 分钟），代价是持续的后台磁盘扫描。</div>
       </div>
 
       <!-- 模型下载 -->

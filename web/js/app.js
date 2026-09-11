@@ -161,12 +161,24 @@ const App = {
     const added = res.added || 0;
     const missing = res.missing || 0;
     const recovered = res.recovered || 0;
-    const extra = res.dir_missing ? "（该目录本身已丢失）" : "";
-    document.getElementById("rescan-summary").textContent =
-      "新增 " + added + " 个 · 发现丢失 " + missing + " 个 · 恢复 " + recovered + " 个" + extra;
     const modal = document.getElementById("rescan-modal");
+    const summary = document.getElementById("rescan-summary");
+    const keepBtn = document.getElementById("rescan-keep");
+    const purgeBtn = document.getElementById("rescan-purge");
+    if (res.root_offline) {
+      // 盘没挂/根目录不可达：本次什么都没标记，也不提供清理
+      summary.textContent = "所在盘 / 根目录当前不可达（未挂载），本次未做任何标记。盘接回后再扫描即可。";
+      purgeBtn.style.display = "none";
+      keepBtn.textContent = "知道了";
+    } else {
+      const extra = res.dir_missing ? "（该目录本身已丢失）" : "";
+      summary.textContent =
+        "新增 " + added + " 个 · 发现丢失 " + missing + " 个 · 恢复 " + recovered + " 个" + extra;
+      purgeBtn.style.display = "";
+      keepBtn.textContent = "保留丢失记录";
+    }
     modal.classList.remove("hidden");
-    document.getElementById("rescan-keep").onclick = () => modal.classList.add("hidden");
+    keepBtn.onclick = () => modal.classList.add("hidden");
     document.getElementById("rescan-purge").onclick = async () => {
       try {
         const r = await API.post("/api/library/purge_missing", { folder_id: folderId });
@@ -201,8 +213,10 @@ const App = {
   async verifyAll() {
     try {
       const res = await API.post("/api/library/verify", {});
+      const off = (res.offline_roots || []).length;
       toast("扫描完成：新标记丢失 " + (res.missing || 0) + " 个 · 恢复 " + (res.recovered || 0) +
-            " 个 · 缺失目录 " + (res.dirs_missing || 0) + " 个（未删除记录）", "ok");
+            " 个 · 缺失目录 " + (res.dirs_missing || 0) + " 个" +
+            (off ? " · 离线根目录 " + off + " 个（已跳过未标记）" : "") + "（未删除记录）", "ok");
       await TreeView.refresh();
       await Gallery.load(true);
     } catch (e) {

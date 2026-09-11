@@ -53,25 +53,30 @@ const TreeView = {
   renderNode(parent, node, depth) {
     const hasKids = node.children && node.children.length > 0;
     const isExpanded = App.state.expandedFolders.has(node.id);
-    const missing = !!node.missing;
+    const offline = !!node.offline;              // 所在盘/根目录不可达（未挂载）
+    const missing = !!node.missing && !offline;  // 目录本身被删（根可达时才有意义）
+    const icon = offline ? "💤" : (missing ? "🚫" : "📁");
     const div = document.createElement("div");
     div.className = "tree-node" + (App.state.currentFolderId === node.id ? " active" : "") +
-                    (missing ? " missing" : "");
+                    (offline ? " offline" : (missing ? " missing" : ""));
     div.dataset.folderId = node.id;
     div.style.paddingLeft = (6 + depth * 14) + "px";
     div.innerHTML =
       '<span class="caret">' + (hasKids ? (isExpanded ? "▾" : "▸") : "·") + "</span>" +
       '<span class="label" title="' + escapeHtml(node.path) + '">' +
-      (missing ? "🚫" : "📁") + " " + escapeHtml(node.name) + "</span>" +
+      icon + " " + escapeHtml(node.name) + "</span>" +
       '<span class="count">' +
-      (node.missing_count ? '<span class="miss">' + node.missing_count + "⚠</span> " : "") +
+      (!offline && node.missing_count ? '<span class="miss">' + node.missing_count + "⚠</span> " : "") +
       (node.media_count || "") + "</span>";
-    // 点击目录：校验磁盘存在性（丢失只提示、不删记录），再切换筛选
+    // 点击目录：校验磁盘存在性（离线/丢失都只提示、绝不删记录），再切换筛选
     div.onclick = async (e) => {
       e.stopPropagation();
       try {
         const res = await API.post("/api/library/check", { folder_id: node.id });
-        if (!res.exists) {
+        if (res.root_offline) {
+          toast("所在盘/根目录当前不可达（未挂载）：" + node.path, "err");
+          await this.refresh();
+        } else if (!res.exists) {
           toast("目录路径已丢失：" + node.path, "err");
           await this.refresh();   // 刷新树以显示丢失标记（记录仍保留）
         }
