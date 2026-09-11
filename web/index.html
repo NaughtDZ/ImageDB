@@ -37,7 +37,7 @@
   <div class="actions">
     <button id="btn-import" class="btn primary">＋ 导入目录</button>
     <button id="btn-rescan" class="btn" title="重新扫描当前目录">⟳ 重新扫描</button>
-    <button id="btn-verify" class="btn" title="全库校验：自动清理已删除文件">✔ 校验缺失</button>
+    <button id="btn-verify" class="btn" title="全库扫描：把已丢失的文件标记为「丢失」（不删记录）">🔎 扫描丢失</button>
     <button id="btn-settings" class="btn" title="代理 / 打标 / 视频 / 模型下载">⚙ 设置</button>
   </div>
 </header>
@@ -410,6 +410,24 @@
       <div id="imagetag-log" class="imagetag-log"></div>
     </div>
     <div class="dialog-foot"><button class="btn" data-close="imagetag-log-modal">关闭</button></div>
+  </div>
+</div>
+
+<!-- ========== 重新扫描结果（丢失记录清理确认） ========== -->
+<div id="rescan-modal" class="modal hidden">
+  <div class="dialog">
+    <div class="dialog-head">⟳ 重新扫描结果 <button class="btn close" data-close="rescan-modal">✕</button></div>
+    <div class="dialog-body">
+      <div id="rescan-summary" class="msg" style="margin-bottom:10px"></div>
+      <div class="hint" style="margin-top:0">
+        丢失的媒体记录**不会**被自动删除：它们仍以占位图显示、标签也保留，磁盘接回来即可自动恢复。<br>
+        只有你在这里确认「删除丢失记录」后，才会从数据库移除这些记录。
+      </div>
+    </div>
+    <div class="dialog-foot">
+      <button id="rescan-keep" class="btn">保留丢失记录</button>
+      <button id="rescan-purge" class="btn danger">删除丢失记录</button>
+    </div>
   </div>
 </div>
 

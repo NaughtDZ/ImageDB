@@ -56,6 +56,19 @@ const Viewer = {
     // 标签
     this.renderTags(item);
 
+    // 文件外部丢失：不加载，直接提示路径（记录/标签仍在，盘接回即可恢复）
+    if (item.status === "missing") {
+      video.pause();
+      video.classList.add("hidden");
+      document.getElementById("video-controls").classList.add("hidden");
+      img.classList.add("hidden");
+      img.removeAttribute("src");
+      hint.textContent = "图片路径已丢失：" + item.path;
+      hint.classList.remove("hidden");
+      return;
+    }
+    hint.classList.add("hidden");
+
     if (item.type === "video") {
       img.classList.add("hidden");
       video.classList.remove("hidden");
@@ -94,8 +107,8 @@ const Viewer = {
     for (let d = 1; d <= preloadCount; d++) {
       const next = this.list[this.index + d];
       const prev = this.list[this.index - d];
-      if (next && next.type === "image") targets.push(next);
-      if (prev && prev.type === "image") targets.push(prev);
+      if (next && next.type === "image" && next.status !== "missing") targets.push(next);
+      if (prev && prev.type === "image" && prev.status !== "missing") targets.push(prev);
     }
     for (const item of targets) {
       const im = new Image();

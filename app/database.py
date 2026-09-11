@@ -189,13 +189,15 @@ def execute(sql: str, params: tuple | list = ()) -> int:
             conn.close()
 
 
-def executemany(sql: str, seq: list[tuple]) -> None:
-    """批量执行写操作。"""
+def executemany(sql: str, seq: list[tuple]) -> int:
+    """批量执行写操作，返回实际受影响行数（INSERT OR IGNORE 被忽略的不计）。"""
     with _write_lock:
         conn = _connect()
         try:
-            conn.executemany(sql, seq)
+            cur = conn.executemany(sql, seq)
             conn.commit()
+            rc = cur.rowcount
+            return rc if isinstance(rc, int) and rc > 0 else 0
         finally:
             conn.close()
 

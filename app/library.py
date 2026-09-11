@@ -19,7 +19,8 @@ from __future__ import annotations
 import logging
 import os
 
-from .database import delete, execute, executemany, query_all, query_one
+from .database import (chunk_ids, delete, execute, execute_rowcount, executemany,
+                      query_all, query_one)
 from .imagetag import is_sidecar
 
 logger = logging.getLogger("imagedb.library")
@@ -99,14 +100,14 @@ def _walk_and_insert(dir_path: str, parent_db_id: int, seen: set[str]) -> tuple[
             continue
 
     # 批量写入媒体记录（INSERT OR IGNORE：已存在的路径不重复插入）
+    # 注意：media_added 用「实际插入行数」而非「扫描到的文件数」，否则「新增 N」会虚高
     if media_rows:
-        executemany(
+        media_added = executemany(
             """INSERT OR IGNORE INTO media_items
                (folder_id, path, filename, type, ext, size, mtime)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             media_rows,
         )
-        media_added = len(media_rows)
 
     # 递归子目录
     for entry in subdirs:
@@ -321,13 +322,12 @@ def import_folder_progress(root_path: str, progress_cb=None) -> dict:
             except OSError:
                 continue
         if media_rows:
-            executemany(
+            media_added += executemany(
                 """INSERT OR IGNORE INTO media_items
                    (folder_id, path, filename, type, ext, size, mtime)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 media_rows,
             )
-            media_added += len(media_rows)
             done_counter["n"] += len(media_rows)
             if progress_cb:
                 progress_cb(done_counter["n"])
@@ -382,138 +382,138 @@ def _count_media_in(folder_ids: list[int]) -> int:
     return row["c"] if row else 0
 
 
+# ---------------- 丢失标记（外部丢失不删记录） ----------------
+def _mark_all_missing(folder_ids: list[int]) -> int:
+    """把若干目录下的所有媒体标记为 missing（**不删除**）。返回被标记的数量。"""
+    if not folder_ids:
+        return 0
+    n = 0
+    for chunk in chunk_ids(folder_ids):
+        ph = ",".join("?" * len(chunk))
+        n += execute_rowcount(
+            "UPDATE media_items SET status = 'missing'"
+            f" WHERE folder_id IN ({ph}) AND (status IS NULL OR status != 'missing')",
+            chunk,
+        )
+    return n
+
+
+def _sync_dir_status(folder_db_id: int, dir_path: str) -> tuple[int, int]:
+    """按磁盘实际文件名，把该目录下媒体记录在 ok/missing 间同步（**不删除**）。
+    返回 (新标记为 missing 数, 恢复为 ok 数)。"""
+    try:
+        on_disk = {e.name for e in os.scandir(dir_path)}
+    except OSError:
+        return 0, 0
+    miss = 0
+    ok = 0
+    for item in query_all("SELECT id, filename, status FROM media_items WHERE folder_id = ?",
+                          (folder_db_id,)):
+        want = "ok" if item["filename"] in on_disk else "missing"
+        if (item["status"] or "ok") != want:
+            execute("UPDATE media_items SET status = ? WHERE id = ?", (want, item["id"]))
+            if want == "missing":
+                miss += 1
+            else:
+                ok += 1
+    return miss, ok
+
+
 def rescan_folder(folder_id: int) -> dict:
-    """
-    重新扫描某个目录子树：
-    - 磁盘上已不存在的子目录 → 数据库级联删除；
-    - 磁盘上已不存在的媒体 → 删除记录；
-    - 磁盘上新增的目录/媒体 → 补录。
+    """重新扫描某个目录子树（**只标记、不删除**）：
+    - 磁盘上新增的目录/媒体 → 补录；
+    - 磁盘上已消失的媒体 → 标记 status='missing'（保留记录/标签/缩略图）；
+    - 之前 missing 现在又出现的 → 标回 'ok'；
+    - 目录本身消失 → 其下媒体全部标记 missing（不删目录、不删记录）。
+    返回 {added, missing, recovered, dir_missing}。
+    真正删除记录请用 purge_missing()（用户显式确认后）。
     """
     folder = query_one("SELECT * FROM folders WHERE id = ?", (folder_id,))
     if not folder:
         raise ValueError(f"目录 id 不存在：{folder_id}")
     if not os.path.isdir(folder["path"]):
-        # 根目录已不存在：整棵子树从数据库删除
-        n_media = _count_media_in(_subtree_folder_ids(folder_id))
-        delete("DELETE FROM folders WHERE id = ?", (folder_id,))
-        return {"added": 0, "removed_media": n_media, "removed_folders": 1}
+        missing = _mark_all_missing(_subtree_folder_ids(folder_id))
+        return {"added": 0, "missing": missing, "recovered": 0, "dir_missing": True}
 
-    added = 0
-    removed_media = 0
-    removed_folders = 0
-
-    # 1. 删除磁盘上已不存在的子目录记录（级联删除其媒体）
-    for f in query_all("SELECT id, path FROM folders WHERE parent_id = ? OR id = ?",
-                       (folder_id, folder_id)):
-        if not os.path.isdir(f["path"]):
-            n = _count_media_in(_subtree_folder_ids(f["id"]))
-            delete("DELETE FROM folders WHERE id = ?", (f["id"],))
-            removed_media += n
-            removed_folders += 1
-
-    # 2. 补录新增的目录与媒体
+    # 1. 补录磁盘上新增的目录与媒体
     seen: set[str] = {os.path.realpath(folder["path"])}
-    fa, ma = _walk_and_insert(folder["path"], folder_id, seen)
-    added = ma
+    _fa, added = _walk_and_insert(folder["path"], folder_id, seen)
 
-    # 3. 删除仍存在目录中已消失的媒体
+    # 2. 逐目录同步 ok/missing（不删任何记录）
+    missing = 0
+    recovered = 0
     for f in _subtree_folder_ids(folder_id):
         frow = query_one("SELECT path FROM folders WHERE id = ?", (f,))
-        if not frow or not os.path.isdir(frow["path"]):
+        if not frow:
             continue
-        try:
-            on_disk = {e.name for e in os.scandir(frow["path"])}
-        except OSError:
+        if not os.path.isdir(frow["path"]):
+            missing += _mark_all_missing([f])
             continue
-        for item in query_all("SELECT id, filename FROM media_items WHERE folder_id = ?", (f,)):
-            if item["filename"] not in on_disk:
-                delete("DELETE FROM media_items WHERE id = ?", (item["id"],))
-                removed_media += 1
+        m, o = _sync_dir_status(f, frow["path"])
+        missing += m
+        recovered += o
 
-    return {"added": added, "removed_media": removed_media, "removed_folders": removed_folders}
+    return {"added": added, "missing": missing, "recovered": recovered, "dir_missing": False}
+
+
+def purge_missing(folder_id: int) -> dict:
+    """删除某目录子树下所有 status='missing' 的媒体记录（**仅在用户显式确认后调用**）。
+
+    同时清理这些记录的缩略图缓存。返回 {removed}。
+    """
+    ids = _subtree_folder_ids(folder_id)
+    if not ids:
+        return {"removed": 0}
+    mids: list[int] = []
+    for chunk in chunk_ids(ids):
+        ph = ",".join("?" * len(chunk))
+        mids.extend(r["id"] for r in query_all(
+            f"SELECT id FROM media_items WHERE folder_id IN ({ph}) AND status = 'missing'", chunk))
+    if not mids:
+        return {"removed": 0}
+    try:
+        from . import media as media_service
+        media_service.delete_thumbnails(mids)
+    except Exception:  # noqa: BLE001
+        pass
+    removed = 0
+    for chunk in chunk_ids(mids):
+        ph = ",".join("?" * len(chunk))
+        removed += delete(f"DELETE FROM media_items WHERE id IN ({ph})", chunk)
+    logger.info("清理丢失记录：目录 %s 下删除 %d 条", folder_id, removed)
+    return {"removed": removed}
 
 
 def verify_all() -> dict:
+    """全库校验（**只标记、不删除**）：磁盘上不存在的媒体 → status='missing'；
+    重新出现的 → 标回 'ok'。**绝不删除任何数据库记录**（清理须用户显式确认）。
+    由后台校验线程与「扫描丢失」按钮调用。返回 {missing, recovered, dirs_missing}。
     """
-    全库校验：遍历所有根目录，磁盘上不存在的目录/文件自动从数据库删除。
-    由后台校验线程与“手动校验”按钮调用。
-    所有删除路径都会同步清理缩略图缓存文件（避免幽灵缩略图堆积）。
-    返回清理统计。
-    """
-    removed_folders = 0
-    removed_media = 0
-
-    def _collect_media_ids(folder_id):
-        """收集子树下所有媒体 id。"""
-        return [r["id"] for r in query_all(
-            """WITH RECURSIVE sub(id) AS (
-                   SELECT id FROM folders WHERE id = ?
-                   UNION ALL
-                   SELECT f.id FROM folders f JOIN sub s ON f.parent_id = s.id
-               )
-               SELECT m.id FROM media_items m JOIN sub s ON m.folder_id = s.id""",
-            (folder_id,))]
-
-    roots = query_all("SELECT id, path FROM folders WHERE is_root = 1")
-    for root in roots:
-        if not os.path.isdir(root["path"]):
-            # 根目录不存在：先清缩略图，再删整棵子树
-            try:
-                from . import media as media_service
-                media_service.delete_thumbnails(_collect_media_ids(root["id"]))
-            except Exception:  # noqa: BLE001
-                pass
-            n = _count_media_in(_subtree_folder_ids(root["id"]))
-            delete("DELETE FROM folders WHERE id = ?", (root["id"],))
-            removed_folders += 1
-            removed_media += n
+    missing = 0
+    recovered = 0
+    dirs_missing = 0
+    for f in query_all("SELECT id, path FROM folders"):
+        if not os.path.isdir(f["path"]):
+            dirs_missing += 1
+            missing += _mark_all_missing([f["id"]])
             continue
-        # 检查根目录下的所有子目录
-        for f in _subtree_folder_ids(root["id"]):
-            frow = query_one("SELECT path FROM folders WHERE id = ?", (f,))
-            if not frow:
-                continue
-            if not os.path.isdir(frow["path"]):
-                # 子目录不存在：清缩略图，再删除该子树
-                try:
-                    from . import media as media_service
-                    media_service.delete_thumbnails(_collect_media_ids(f))
-                except Exception:  # noqa: BLE001
-                    pass
-                n = _count_media_in(_subtree_folder_ids(f))
-                delete("DELETE FROM folders WHERE id = ?", (f,))
-                removed_folders += 1
-                removed_media += n
-                continue
-            # 逐目录比对磁盘文件名，删除已消失的媒体
-            try:
-                on_disk = {e.name for e in os.scandir(frow["path"])}
-            except OSError:
-                continue
-            for item in query_all("SELECT id, filename FROM media_items WHERE folder_id = ?", (f,)):
-                if item["filename"] not in on_disk:
-                    try:
-                        from . import media as media_service
-                        media_service.delete_thumbnails([item["id"]])
-                    except Exception:  # noqa: BLE001
-                        pass
-                    delete("DELETE FROM media_items WHERE id = ?", (item["id"],))
-                    removed_media += 1
+        m, o = _sync_dir_status(f["id"], f["path"])
+        missing += m
+        recovered += o
+    return {"missing": missing, "recovered": recovered, "dirs_missing": dirs_missing}
+
+
 def check_folder(folder_id: int) -> dict:
-    """
-    校验单个目录（用户点击树节点时调用）：
-    目录已不存在则自动删除子树并返回 exists=False。
+    """校验单个目录（用户点击树节点时调用）：
+    目录已不存在 → 只把其下媒体标记 missing 并返回 exists=False（**绝不删记录**）。
     """
     folder = query_one("SELECT * FROM folders WHERE id = ?", (folder_id,))
     if not folder:
-        return {"exists": False, "removed_folders": 0, "removed_media": 0}
+        return {"exists": False, "missing": 0}
     if not os.path.isdir(folder["path"]):
-        n = _count_media_in(_subtree_folder_ids(folder_id))
-        nf = len(_subtree_folder_ids(folder_id))
-        delete("DELETE FROM folders WHERE id = ?", (folder_id,))
-        return {"exists": False, "removed_folders": nf, "removed_media": n}
-    return {"exists": True, "removed_folders": 0, "removed_media": 0}
-
+        n = _mark_all_missing(_subtree_folder_ids(folder_id))
+        return {"exists": False, "missing": n}
+    return {"exists": True, "missing": 0}
 
 def remove_folder(folder_id: int) -> int:
     """
@@ -540,7 +540,10 @@ def remove_folder(folder_id: int) -> int:
 
 
 def remove_media_item(media_id: int) -> bool:
-    """从库中删除单个媒体记录（文件被外部删除时调用），并同步清理缩略图文件。"""
+    """从库中删除单个媒体记录（仅在**用户显式删除**时调用），并同步清理缩略图文件。
+
+    注意：文件被外部删除时**不要**调用本函数——那只会把 status 标记为 missing（见 verify_all）。
+    """
     try:
         from . import media as media_service
         media_service.delete_thumbnails([media_id])
@@ -561,6 +564,9 @@ def build_tree() -> dict:
     folders = query_all("SELECT * FROM folders ORDER BY name")
     counts = query_all("SELECT folder_id, COUNT(*) AS c FROM media_items GROUP BY folder_id")
     count_map = {r["folder_id"]: r["c"] for r in counts}
+    miss_rows = query_all(
+        "SELECT folder_id, COUNT(*) AS c FROM media_items WHERE status = 'missing' GROUP BY folder_id")
+    miss_map = {r["folder_id"]: r["c"] for r in miss_rows}
 
     nodes: dict[int, dict] = {}
     for f in folders:
@@ -572,6 +578,10 @@ def build_tree() -> dict:
             "parent_id": f["parent_id"],
             "children": [],
             "media_count": count_map.get(f["id"], 0),
+            # 目录本身是否还在磁盘上（动态检测，不写库）；缺失目录仍显示，仅标注
+            "missing": not os.path.isdir(f["path"]),
+            # 该目录下被标记为丢失的媒体数
+            "missing_count": miss_map.get(f["id"], 0),
         }
 
     roots: list[dict] = []

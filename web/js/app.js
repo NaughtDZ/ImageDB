@@ -153,7 +153,35 @@ const App = {
     poll();
   },
 
-  /** 重新扫描当前目录 */
+  /**
+   * 显示「重新扫描」结果，并让用户决定是否清理丢失记录。
+   * 外部丢失一律不自动删除：记录/标签保留，盘接回可恢复；只有这里确认才删。
+   */
+  showRescanResult(res, folderId) {
+    const added = res.added || 0;
+    const missing = res.missing || 0;
+    const recovered = res.recovered || 0;
+    const extra = res.dir_missing ? "（该目录本身已丢失）" : "";
+    document.getElementById("rescan-summary").textContent =
+      "新增 " + added + " 个 · 发现丢失 " + missing + " 个 · 恢复 " + recovered + " 个" + extra;
+    const modal = document.getElementById("rescan-modal");
+    modal.classList.remove("hidden");
+    document.getElementById("rescan-keep").onclick = () => modal.classList.add("hidden");
+    document.getElementById("rescan-purge").onclick = async () => {
+      try {
+        const r = await API.post("/api/library/purge_missing", { folder_id: folderId });
+        toast("已从数据库删除 " + r.removed + " 条丢失记录", "ok");
+        modal.classList.add("hidden");
+        await TreeView.refresh();
+        await Gallery.load(true);
+        SidePanel.refresh();
+      } catch (e) {
+        toast("清理失败：" + e.message, "err");
+      }
+    };
+  },
+
+  /** 重新扫描当前目录（只标记丢失，弹窗询问是否清理） */
   async rescanCurrent() {
     if (!this.state.currentFolderId) {
       toast("请先在左侧选择一个目录", "err");
@@ -161,23 +189,24 @@ const App = {
     }
     try {
       const res = await API.post("/api/library/rescan", { folder_id: this.state.currentFolderId });
-      toast("扫描完成：新增 " + res.added + "，清理缺失 " + res.removed_media, "ok");
       await TreeView.refresh();
       await Gallery.load(true);
+      this.showRescanResult(res, this.state.currentFolderId);
     } catch (e) {
       toast("扫描失败：" + e.message, "err");
     }
   },
 
-  /** 全库校验缺失 */
+  /** 全库扫描丢失（只标记，不删记录） */
   async verifyAll() {
     try {
       const res = await API.post("/api/library/verify", {});
-      toast("校验完成：清理目录 " + res.removed_folders + " 个，媒体 " + res.removed_media + " 个", "ok");
+      toast("扫描完成：新标记丢失 " + (res.missing || 0) + " 个 · 恢复 " + (res.recovered || 0) +
+            " 个 · 缺失目录 " + (res.dirs_missing || 0) + " 个（未删除记录）", "ok");
       await TreeView.refresh();
       await Gallery.load(true);
     } catch (e) {
-      toast("校验失败：" + e.message, "err");
+      toast("扫描失败：" + e.message, "err");
     }
   },
 

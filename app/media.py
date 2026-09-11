@@ -275,3 +275,37 @@ def get_thumbnail_path(media_id: int) -> str | None:
     if not row or not row["thumbnail"]:
         return None
     return row["thumbnail"]
+
+# ---------------- 内置占位缩略图（文件外部丢失时显示） ----------------
+PLACEHOLDER_NAME = "_missing.jpg"
+
+
+def placeholder_thumb_path() -> str:
+    """返回内置占位缩略图路径（首次调用时生成，缓存于 data/thumbs/_missing.jpg）。
+
+    用于媒体文件被外部删除/移走时（status='missing'）显示「破图」占位，而不是 404。
+    生成失败返回空字符串。
+    """
+    p = os.path.join(_thumb_dir(), PLACEHOLDER_NAME)
+    if os.path.isfile(p):
+        return p
+    if not HAS_PIL:
+        return ""
+    try:
+        from PIL import Image, ImageDraw
+        size = 320
+        im = Image.new("RGB", (size, size), (42, 46, 54))
+        d = ImageDraw.Draw(im)
+        d.rectangle([size * 0.22, size * 0.30, size * 0.78, size * 0.70],
+                    outline=(120, 126, 140), width=6)
+        d.line([size * 0.24, size * 0.68, size * 0.42, size * 0.48,
+                size * 0.55, size * 0.62, size * 0.76, size * 0.40],
+               fill=(120, 126, 140), width=6)
+        d.line([size * 0.30, size * 0.30, size * 0.70, size * 0.70], fill=(224, 85, 85), width=10)
+        d.line([size * 0.70, size * 0.30, size * 0.30, size * 0.70], fill=(224, 85, 85), width=10)
+        im.save(p, "JPEG", quality=85)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("生成占位缩略图失败：%s", exc)
+        return ""
+    return p
+

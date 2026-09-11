@@ -12,6 +12,18 @@
  *
  * 分页模式：每次一页，翻页丢弃旧页 DOM 省内存，滚动回顶。
  * ============================================================ */
+
+// 文件外部丢失时的内置占位图（纯前端内联 SVG，不发请求、不依赖后端文件）
+const MISSING_SVG =
+  '<svg viewBox="0 0 100 100" preserveAspectRatio="none" ' +
+  'style="position:absolute;inset:0;width:100%;height:100%">' +
+  '<rect width="100" height="100" fill="#2a2e37"/>' +
+  '<rect x="24" y="30" width="52" height="40" fill="none" stroke="#6b7280" stroke-width="3"/>' +
+  '<polyline points="26,68 42,48 55,62 74,40" fill="none" stroke="#6b7280" stroke-width="3"/>' +
+  '<line x1="30" y1="30" x2="70" y2="70" stroke="#e05555" stroke-width="5"/>' +
+  '<line x1="70" y1="30" x2="30" y2="70" stroke="#e05555" stroke-width="5"/>' +
+  "</svg>";
+
 const Gallery = {
   // 内存缩略图缓存：mediaId -> 已加载的 <img>（LRU）
   _thumbCache: new Map(),
@@ -205,27 +217,42 @@ const Gallery = {
 
   /** 渲染单个媒体卡片：文件名/徽标立即显示，缩略图占位（含渐变过渡） */
   renderCard(item) {
+    const missing = item.status === "missing";
     const card = document.createElement("div");
-    card.className = "media-card" + (App.state.selected.has(item.id) ? " selected" : "");
+    card.className = "media-card" + (App.state.selected.has(item.id) ? " selected" : "") +
+                     (missing ? " missing" : "");
     card.dataset.id = item.id;
 
-    // 缩略图容器：先显示占位背景，图片加载后淡入
+    // 缩略图容器：正常 → 占位背景 + 图片淡入；丢失 → 内置占位图（不发请求）
     const thumbBox = document.createElement("div");
     thumbBox.className = "thumb-box";
-    thumbBox.style.background = "var(--bg-hover)";   // 占位
-    const img = document.createElement("img");
-    img.alt = item.filename;
-    img.className = "thumb-img";
-    img.style.opacity = "0";   // 初始透明，加载后淡入
-    img.dataset.loaded = "0";
-    thumbBox.appendChild(img);
+    if (missing) {
+      thumbBox.classList.add("missing-thumb");
+      thumbBox.innerHTML = MISSING_SVG;
+    } else {
+      thumbBox.style.background = "var(--bg-hover)";   // 占位
+      const img = document.createElement("img");
+      img.alt = item.filename;
+      img.className = "thumb-img";
+      img.style.opacity = "0";   // 初始透明，加载后淡入
+      img.dataset.loaded = "0";
+      thumbBox.appendChild(img);
+    }
     card.appendChild(thumbBox);
 
     // 类型徽标（立即显示）
     const badge = document.createElement("span");
     badge.className = "badge";
-    badge.textContent = item.type === "video" ? "🎬" : "🖼";
+    badge.textContent = missing ? "⚠" : (item.type === "video" ? "🎬" : "🖼");
     card.appendChild(badge);
+
+    // 丢失角标
+    if (missing) {
+      const mb = document.createElement("span");
+      mb.className = "missing-badge";
+      mb.textContent = "丢失";
+      card.appendChild(mb);
+    }
 
     // 视频时长（立即显示）
     if (item.type === "video" && item.duration) {
@@ -262,6 +289,8 @@ const Gallery = {
       this.updateSelInfo();
       SidePanel.open();
       SidePanel.refresh();
+      // 文件外部丢失：提示路径（记录不会被删除，仍可在此看到占位）
+      if (missing) toast("图片路径已丢失：" + item.path, "err");
     };
 
     card.ondblclick = (e) => {

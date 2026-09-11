@@ -417,17 +417,20 @@ _thumb_clean_counter = 0
 
 
 def _require_media(mid: int, auto_clean: bool = True) -> dict:
-    """
-    查询媒体记录；若文件已被外部删除：
-    - 自动从数据库清理该条目（满足“即时清理”需求）；
-    - 返回 None 并抛 HTTP 410。
+    """查询媒体记录，并把「文件是否还在磁盘上」同步到 status（**绝不删除记录**）。
+
+    - 文件在 → status='ok'（之前若为 missing 会自动恢复）；
+    - 文件不在 → status='missing'（保留记录/标签/缩略图；外部丢失不销毁数据）。
+    调用方应根据 row["status"] 决定响应（缺失时给占位图/提示，而不是删库）。
+    auto_clean 参数保留仅为兼容旧调用，已不再触发任何删除。
     """
     row = query_one("SELECT * FROM media_items WHERE id = ?", (mid,))
     if row is None:
         raise HTTPException(404, "记录不存在")
-    if auto_clean and not os.path.isfile(row["path"]):
-        library.remove_media_item(mid)
-        raise HTTPException(410, "文件不存在，已自动从库中删除")
+    want = "ok" if os.path.isfile(row["path"]) else "missing"
+    if (row["status"] or "ok") != want:
+        execute("UPDATE media_items SET status = ? WHERE id = ?", (want, mid))
+        row["status"] = want
     return row
 
 
@@ -439,7 +442,7 @@ def create_app(config: AppConfig) -> FastAPI:
     async def lifespan(app: FastAPI):
         # 启动：初始化打标插件管理器
         tagging_manager.init_manager(lambda: config)
-        # 启动后台校验线程（自动清理磁盘上已不存在的文件记录）
+        # 启动后台校验线程（只把外部丢失的媒体标记为 missing，绝不删记录）
         interval = config.get_int("verify_interval_sec", 60)
         if interval > 0:
             def verify_loop() -> None:
@@ -491,7 +494,10 @@ def create_app(config: AppConfig) -> FastAPI:
             return dict(job)
     @app.post("/api/library/rescan")
     def api_rescan(req: FolderIdRequest) -> dict:
-        """重新扫描目录：补录新增、清理缺失。"""
+        """重新扫描目录（**只标记不删**）：补录新增、把消失的媒体标记为 missing。
+
+        返回 {added, missing, recovered, dir_missing}，由前端弹窗询问是否清理丢失记录。
+        """
         try:
             return library.rescan_folder(req.folder_id)
         except ValueError as exc:
@@ -504,13 +510,18 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @app.post("/api/library/verify")
     def api_verify() -> dict:
-        """全库校验：磁盘上不存在的目录/文件自动清理。"""
+        """全库扫描（**只标记不删**）：把磁盘上已不存在的媒体标记为 missing。"""
         return library.verify_all()
 
     @app.post("/api/library/check")
     def api_check(req: FolderIdRequest) -> dict:
-        """检查单个目录是否仍然存在（用户点击树节点时调用，不存在则自动清理）。"""
+        """检查单个目录是否仍存在（点击树节点时调用）；不存在只标记 missing，不删记录。"""
         return library.check_folder(req.folder_id)
+
+    @app.post("/api/library/purge_missing")
+    def api_purge_missing(req: FolderIdRequest) -> dict:
+        """删除某目录子树下所有 status='missing' 的媒体记录（**用户显式确认后调用**）。"""
+        return library.purge_missing(req.folder_id)
 
     # ================= 媒体 =================
     @app.get("/api/media")
@@ -791,14 +802,24 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @app.get("/api/media/{mid}/file")
     def api_media_file(mid: int):
-        """流式读取原文件（FileResponse 支持视频 Range 拖动）。"""
+        """流式读取原文件（FileResponse 支持视频 Range 拖动）。文件外部丢失时返回 404（含路径）。"""
         row = _require_media(mid)
+        if row["status"] == "missing":
+            raise HTTPException(404, f"图片路径已丢失：{row['path']}")
         return FileResponse(row["path"], filename=row["filename"])
 
     @app.get("/api/media/{mid}/thumbnail")
     def api_media_thumbnail(mid: int, regenerate: bool = False):
-        """缩略图：已存在直接返回，否则自动生成（视频取指定秒数的帧）。"""
+        """缩略图：已存在直接返回，否则自动生成（视频取指定秒数的帧）。
+
+        文件外部丢失（status=missing）时返回**内置占位图**，不删记录、不报错。
+        """
         row = _require_media(mid)
+        if row["status"] == "missing":
+            ph = media_service.placeholder_thumb_path()
+            if ph:
+                return FileResponse(ph)
+            raise HTTPException(404, f"图片路径已丢失：{row['path']}")
         if row["thumbnail"] and not regenerate:
             abs_path = os.path.join(DATA_DIR, row["thumbnail"])
             if os.path.isfile(abs_path):
@@ -825,6 +846,8 @@ def create_app(config: AppConfig) -> FastAPI:
     def api_media_frames(mid: int, interval: Optional[float] = None):
         """视频抽帧（供打标预览），返回帧图 URL 列表。"""
         row = _require_media(mid)
+        if row["status"] == "missing":
+            raise HTTPException(404, f"文件路径已丢失：{row['path']}")
         if row["type"] != "video":
             raise HTTPException(400, "仅视频支持抽帧")
         cfg = config

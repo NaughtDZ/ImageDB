@@ -451,5 +451,17 @@ body.selecting { user-select: none; cursor: crosshair; }
 .imagetag-log .err { color: var(--danger); }
 .imagetag-log .ok { color: var(--ok); }
 .imagetag-log ul { margin: 2px 0 0 16px; }
+/* ---------- 丢失媒体 / 丢失目录（外部丢失占位） ---------- */
+.media-card.missing { border-style: dashed; opacity: .8; }
+.media-card.missing:hover { border-color: var(--danger); }
+.thumb-box.missing-thumb { background: #2a2e37; }
+.missing-badge {
+  position: absolute; top: 6px; left: 6px;
+  background: rgba(192, 57, 43, .9); color: #fff;
+  font-size: 11px; padding: 2px 6px; border-radius: 4px;
+}
+.tree-node.missing .label { color: var(--danger); }
+.tree-node .count .miss { color: var(--danger); }
+
 
 

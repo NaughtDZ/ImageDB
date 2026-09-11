@@ -53,24 +53,27 @@ const TreeView = {
   renderNode(parent, node, depth) {
     const hasKids = node.children && node.children.length > 0;
     const isExpanded = App.state.expandedFolders.has(node.id);
+    const missing = !!node.missing;
     const div = document.createElement("div");
-    div.className = "tree-node" + (App.state.currentFolderId === node.id ? " active" : "");
+    div.className = "tree-node" + (App.state.currentFolderId === node.id ? " active" : "") +
+                    (missing ? " missing" : "");
     div.dataset.folderId = node.id;
     div.style.paddingLeft = (6 + depth * 14) + "px";
     div.innerHTML =
       '<span class="caret">' + (hasKids ? (isExpanded ? "▾" : "▸") : "·") + "</span>" +
-      '<span class="label" title="' + escapeHtml(node.path) + '">📁 ' + escapeHtml(node.name) + "</span>" +
-      '<span class="count">' + (node.media_count || "") + "</span>";
-    // 点击目录：先校验磁盘存在性（不存在则后端自动清理），再切换筛选
+      '<span class="label" title="' + escapeHtml(node.path) + '">' +
+      (missing ? "🚫" : "📁") + " " + escapeHtml(node.name) + "</span>" +
+      '<span class="count">' +
+      (node.missing_count ? '<span class="miss">' + node.missing_count + "⚠</span> " : "") +
+      (node.media_count || "") + "</span>";
+    // 点击目录：校验磁盘存在性（丢失只提示、不删记录），再切换筛选
     div.onclick = async (e) => {
       e.stopPropagation();
       try {
         const res = await API.post("/api/library/check", { folder_id: node.id });
         if (!res.exists) {
-          toast("目录已不存在，已自动从库中移除", "err");
-          await this.refresh();
-          await Gallery.load(true);
-          return;
+          toast("目录路径已丢失：" + node.path, "err");
+          await this.refresh();   // 刷新树以显示丢失标记（记录仍保留）
         }
       } catch (err) { /* 网络错误不阻塞切换 */ }
       App.state.currentFolderId = node.id;
@@ -190,26 +193,26 @@ const TreeView = {
     }
   },
 
-  /** 重新扫描某目录 */
+  /** 重新扫描某目录（只标记丢失，弹窗询问是否清理；不自动删记录） */
   async rescan(node) {
     try {
       const res = await API.post("/api/library/rescan", { folder_id: node.id });
-      toast("扫描完成：新增 " + res.added + "，清理缺失 " + res.removed_media, "ok");
       await this.refresh();
       await Gallery.load(true);
+      App.showRescanResult(res, node.id);
     } catch (e) {
       toast("扫描失败：" + e.message, "err");
     }
   },
 
-  /** 校验某目录（不存在则自动清理） */
+  /** 检查某目录是否还在磁盘（丢失只标记，不删记录） */
   async verify(node) {
     try {
       const res = await API.post("/api/library/check", { folder_id: node.id });
       if (res.exists) {
-        toast("目录存在，未发现缺失", "ok");
+        toast("目录存在", "ok");
       } else {
-        toast("目录已不存在，已自动清理（媒体 " + res.removed_media + " 个）", "err");
+        toast("目录路径已丢失：" + node.path + "（记录已保留，未删除）", "err");
       }
       await this.refresh();
     } catch (e) {
