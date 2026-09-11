@@ -628,6 +628,8 @@ def build_tree() -> dict:
           "total_folders": int, "total_media": int
         }
     """
+    import time as _time
+    _t0 = _time.perf_counter()
     folders = query_all("SELECT * FROM folders ORDER BY name")
     counts = query_all("SELECT folder_id, COUNT(*) AS c FROM media_items GROUP BY folder_id")
     count_map = {r["folder_id"]: r["c"] for r in counts}
@@ -661,17 +663,23 @@ def build_tree() -> dict:
         else:
             roots.append(node)
 
-    # 逐个根判断可达性并向下传播：根不可达 = 整棵「离线」（盘没挂），
-    # 此时不显示为「丢失」（避免拔盘就把整库标成缺失）。
+    # 性能要点：目录树必须保持「纯数据库读取」，**绝不逐目录 stat**。
+    # 网络盘上 5000+ 个目录各来一次 isdir 会让启动/加载目录树慢十几秒。
+    # 因此这里只在「根目录」上做可达性检查（通常 1~2 个根 = 1~2 次 stat），
+    # 再向下传播 offline 标记；单目录是否被删改成点击该节点时按需判定（见 check_folder）。
     def _walk(node: dict, offline: bool) -> None:
         node["offline"] = offline
-        node["missing"] = (not offline) and (not os.path.isdir(node["path"]))
+        node["missing"] = False   # 启动时不逐个 stat；点击时按需判定
         for ch in node["children"]:
             _walk(ch, offline)
 
     for r in roots:
         _walk(r, offline=not os.path.isdir(r["path"]))
 
+    _ms = (_time.perf_counter() - _t0) * 1000
+    if _ms > 500:
+        logger.warning("build_tree 耗时 %.0f ms（%d 目录）——目录树应保持纯数据库读取，如有磁盘访问请检查",
+                       _ms, len(folders))
     return {
         "tree": roots,
         "total_folders": len(folders),

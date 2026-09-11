@@ -50,6 +50,14 @@ const TreeView = {
   },
 
   /** 递归渲染单个节点（按 expandedFolders 恢复展开状态） */
+  /** 就地标注某节点为「离线」或「丢失」（不重新拉取整棵树） */
+  markNode(div, node, kind) {
+    div.classList.remove("missing", "offline");
+    div.classList.add(kind);
+    const label = div.querySelector(".label");
+    if (label) label.textContent = (kind === "offline" ? "💤 " : "🚫 ") + node.name;
+  },
+
   renderNode(parent, node, depth) {
     const hasKids = node.children && node.children.length > 0;
     const isExpanded = App.state.expandedFolders.has(node.id);
@@ -75,11 +83,13 @@ const TreeView = {
         const res = await API.post("/api/library/check", { folder_id: node.id });
         if (res.root_offline) {
           toast("所在盘/根目录当前不可达（未挂载）：" + node.path, "err");
-          await this.refresh();
+          this.markNode(div, node, "offline");
         } else if (!res.exists) {
           toast("目录路径已丢失：" + node.path, "err");
-          await this.refresh();   // 刷新树以显示丢失标记（记录仍保留）
+          this.markNode(div, node, "missing");
         }
+        // 注意：这里不整树 refresh —— 目录树是纯数据库读取、不逐目录 stat，
+        // 刷新反而会把刚判定出的标记冲掉；直接就地标注即可。
       } catch (err) { /* 网络错误不阻塞切换 */ }
       App.state.currentFolderId = node.id;
       Gallery.load(true);
