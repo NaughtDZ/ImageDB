@@ -16,6 +16,9 @@ import json
 import logging
 import os
 import sqlite3
+import threading
+import time
+import uuid
 
 from .database import (chunk_ids, execute, execute_rowcount, executemany,
                        query_all, query_one)
@@ -157,10 +160,15 @@ def _subtree_folders(folder_id: int) -> list[dict]:
 
 
 # ---------------- 导出 ----------------
-def export_media(media_rows: list[dict]) -> dict:
+def export_media(media_rows: list[dict], progress_cb=None) -> dict:
     """按选中的媒体（单图/多图）导出：把它们的 tags 写入各自目录的 .imgtag（合并）。
-    media_rows: [{id, path, filename}, ...]。返回统计（含 failed 目录清单）。"""
+
+    media_rows: [{id, path, filename}, ...]。返回统计（含 failed 目录清单）。
+    progress_cb(done, total, message) 可选，用于上报进度。
+    """
     ids = [r["id"] for r in media_rows]
+    if progress_cb:
+        progress_cb(0, 1, "正在读取标签…")
     tmap = _fetch_tags(ids)
     by_dir: dict[str, dict] = {}
     for r in media_rows:
@@ -168,37 +176,62 @@ def export_media(media_rows: list[dict]) -> dict:
         by_dir.setdefault(d, {})[r["filename"]] = tmap.get(r["id"], [])
     failed: list[dict] = []
     written = 0
-    for d, entries in by_dir.items():
+    total = len(by_dir) or 1
+    for i, (d, entries) in enumerate(by_dir.items(), 1):
+        if progress_cb:
+            progress_cb(i, total, "正在写入：" + os.path.basename(d))
         res = write_tags(d, entries, rebuild=False)
         written += res["written"]
         if res["error"]:
             failed.append({"dir": d, "error": res["error"]})
+    if progress_cb:
+        progress_cb(total, total, "导出完成")
     return {"dirs": len(by_dir), "media": len(media_rows), "written": written, "failed": failed}
 
 
-def export_folder(folder_id: int) -> dict:
-    """导出整棵目录树：每个目录写一份 .imgtag（整目录重建为当前库状态）。返回统计（含 failed）。"""
+def _export_one_dir(dir_path: str, folder_db_id: int) -> dict:
+    """导出单个目录（把该目录的 .imgtag 重建为当前库状态）。
+
+    返回 {media, written, skipped, error}；skipped=True 表示该目录没有媒体、已跳过。
+    """
+    rows = query_all("SELECT id, filename FROM media_items WHERE folder_id = ?", (folder_db_id,))
+    if not rows:
+        return {"media": 0, "written": 0, "skipped": True, "error": None}
+    tmap = _fetch_tags([r["id"] for r in rows])
+    entries = {r["filename"]: tmap.get(r["id"], []) for r in rows}
+    res = write_tags(dir_path, entries, rebuild=True)
+    return {"media": len(rows), "written": res["written"], "skipped": False, "error": res["error"]}
+
+
+def export_folder(folder_id: int, progress_cb=None) -> dict:
+    """导出整棵目录树：每个目录写一份 .imgtag（整目录重建为当前库状态）。返回统计（含 failed）。
+
+    progress_cb(done, total, message) 可选，用于上报进度。
+    """
+    folders = _subtree_folders(folder_id)
+    total = len(folders) or 1
     dirs = 0
     media = 0
     written = 0
     failed: list[dict] = []
-    for f in _subtree_folders(folder_id):
-        rows = query_all("SELECT id, filename FROM media_items WHERE folder_id = ?", (f["id"],))
-        if not rows:
+    for i, f in enumerate(folders, 1):
+        if progress_cb:
+            progress_cb(i, total, "正在导出：" + (f.get("name") or f["path"]))
+        r = _export_one_dir(f["path"], f["id"])
+        if r["skipped"]:
             continue
-        tmap = _fetch_tags([r["id"] for r in rows])
-        entries = {r["filename"]: tmap.get(r["id"], []) for r in rows}
-        res = write_tags(f["path"], entries, rebuild=True)
         dirs += 1
-        media += len(rows)
-        written += res["written"]
-        if res["error"]:
-            failed.append({"dir": f["path"], "error": res["error"]})
+        media += r["media"]
+        written += r["written"]
+        if r["error"]:
+            failed.append({"dir": f["path"], "error": r["error"]})
+    if progress_cb:
+        progress_cb(total, total, "导出完成")
     return {"dirs": dirs, "media": media, "written": written, "failed": failed}
 
 
 # ---------------- 导入 ----------------
-def import_folder(folder_id: int, overwrite: bool = False) -> dict:
+def import_folder(folder_id: int, overwrite: bool = False, progress_cb=None) -> dict:
     """导入目录子树：读各目录 .imgtag，按文件名匹配回主库媒体并写回标签（source=import）。
 
     overwrite=True 时替换该来源旧标签，否则去重追加（不覆盖）。
@@ -207,20 +240,37 @@ def import_folder(folder_id: int, overwrite: bool = False) -> dict:
     media_hit = 0
     tags_added = 0
     files = 0
-    for f in _subtree_folders(folder_id):
-        side = read_tags(f["path"])
-        if not side:
-            continue
-        files += 1
-        rows = query_all("SELECT id, filename FROM media_items WHERE folder_id = ?", (f["id"],))
-        byname = {r["filename"]: r["id"] for r in rows}
-        for fname, tags in side.items():
-            mid = byname.get(fname)
-            if mid is None:
-                continue
-            media_hit += 1
-            tags_added += _write_tags(mid, tags, "import", overwrite)
+    folders = _subtree_folders(folder_id)
+    total = len(folders) or 1
+    for i, f in enumerate(folders, 1):
+        if progress_cb:
+            progress_cb(i, total, "正在导入：" + (f.get("name") or f["path"]))
+        r = _import_one_dir(f["path"], f["id"], overwrite)
+        media_hit += r["media"]
+        tags_added += r["tags"]
+        if r["file"]:
+            files += 1
+    if progress_cb:
+        progress_cb(total, total, "导入完成")
     return {"media": media_hit, "tags": tags_added, "files": files}
+
+
+def _import_one_dir(dir_path: str, folder_db_id: int, overwrite: bool) -> dict:
+    """导入单个目录的 .imgtag。返回 {media, tags, file}（file=该目录是否读到 .imgtag）。"""
+    side = read_tags(dir_path)
+    if not side:
+        return {"media": 0, "tags": 0, "file": False}
+    rows = query_all("SELECT id, filename FROM media_items WHERE folder_id = ?", (folder_db_id,))
+    byname = {r["filename"]: r["id"] for r in rows}
+    media_hit = 0
+    tags_added = 0
+    for fname, tags in side.items():
+        mid = byname.get(fname)
+        if mid is None:
+            continue
+        media_hit += 1
+        tags_added += _write_tags(mid, tags, "import", overwrite)
+    return {"media": media_hit, "tags": tags_added, "file": True}
 
 # ---------------- 迁移自检 ----------------
 def _check_dir_sidecar(path: str, media_filenames: list[str]) -> dict:
@@ -243,7 +293,7 @@ def _check_dir_sidecar(path: str, media_filenames: list[str]) -> dict:
     return report
 
 
-def self_check(folder_id: int) -> dict:
+def self_check(folder_id: int, progress_cb=None) -> dict:
     """迁移前自检：目录树内「主库媒体 vs 磁盘 vs .imgtag」的一致性。
 
     返回：
@@ -256,7 +306,11 @@ def self_check(folder_id: int) -> dict:
     missing_imgtag: list[str] = []
     orphan_refs: list[str] = []
     uncovered: list[str] = []
-    for f in _subtree_folders(folder_id):
+    folders = _subtree_folders(folder_id)
+    total = len(folders) or 1
+    for i, f in enumerate(folders, 1):
+        if progress_cb:
+            progress_cb(i, total, "正在自检：" + (f.get("name") or f["path"]))
         rows = query_all("SELECT id, filename FROM media_items WHERE folder_id = ?", (f["id"],))
         if not rows:
             continue
@@ -267,6 +321,8 @@ def self_check(folder_id: int) -> dict:
             missing_imgtag.append(rep["path"])
         orphan_refs.extend(rep["orphan_refs"])
         uncovered.extend(rep["uncovered"])
+    if progress_cb:
+        progress_cb(total, total, "自检完成")
     # 超限截断，避免前端爆
     return {
         "dirs": dirs,
@@ -277,4 +333,119 @@ def self_check(folder_id: int) -> dict:
         "orphan_total": len(orphan_refs),
         "uncovered_total": len(uncovered),
     }
+
+# ---------------- 后台任务（带进度，供前端轮询） ----------------
+# 导出/导入/自检可能要对成千上万个目录读写 .imgtag（网络盘上很慢），
+# 因此统一放到后台线程执行，前端按 job_id 轮询进度，避免"点了没反应"。
+JOBS: dict[str, dict] = {}
+_JOBS_LOCK = threading.Lock()
+_MAX_JOBS = 50
+
+
+def _new_job(kind: str, label: str) -> str:
+    jid = uuid.uuid4().hex[:12]
+    with _JOBS_LOCK:
+        if len(JOBS) >= _MAX_JOBS:   # 简单裁剪：丢弃最旧的
+            for k in sorted(JOBS, key=lambda x: JOBS[x]["_ts"])[: len(JOBS) - _MAX_JOBS + 1]:
+                JOBS.pop(k, None)
+        JOBS[jid] = {
+            "id": jid, "kind": kind, "label": label, "status": "running",
+            "total": 0, "done": 0, "progress": 0,
+            "message": "准备中…", "result": None, "error": None,
+            "_ts": time.time(),
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    return jid
+
+
+def _progress_cb(jid: str):
+    """生成进度回调：写入任务记录的 done/total/progress/message。"""
+    def cb(done: int, total: int, message: str = "") -> None:
+        pct = int(done / total * 100) if total else 0
+        with _JOBS_LOCK:
+            job = JOBS.get(jid)
+            if job:
+                job.update(done=done, total=total, progress=min(99, pct),
+                           message=message or (str(done) + "/" + str(total)))
+    return cb
+
+
+def _finish(jid: str, status: str, result=None, error: str | None = None) -> None:
+    with _JOBS_LOCK:
+        job = JOBS.get(jid)
+        if job:
+            job.update(status=status, result=result, error=error,
+                       progress=100 if status == "done" else job.get("progress", 0),
+                       message="完成" if status == "done" else (error or "失败"),
+                       finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+
+
+def _run_async(jid: str, fn) -> str:
+    def worker() -> None:
+        try:
+            _finish(jid, "done", result=fn())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("imgtag 任务失败 %s：%s", jid, exc)
+            _finish(jid, "failed", error=str(exc))
+    threading.Thread(target=worker, daemon=True, name="imgtag-" + jid).start()
+    return jid
+
+
+def get_job(jid: str) -> dict | None:
+    with _JOBS_LOCK:
+        job = JOBS.get(jid)
+        return dict(job) if job else None
+
+
+def list_jobs(limit: int = 30) -> list[dict]:
+    with _JOBS_LOCK:
+        items = sorted(JOBS.values(), key=lambda j: j["_ts"], reverse=True)
+        return [{k: v for k, v in j.items() if k not in ("result", "_ts")} for j in items[:limit]]
+
+
+# ---- 启动任务（立即返回 job_id，结果放在 job["result"]） ----
+def start_export_media(media_rows: list[dict]) -> str:
+    """后台导出：选中媒体 → 各目录 .imgtag。"""
+    jid = _new_job("export", "导出标签到 .imgtag（选中项）")
+    return _run_async(jid, lambda: export_media(media_rows, _progress_cb(jid)))
+
+
+def start_export_folders(folder_ids: list[int]) -> str:
+    """后台导出：整棵目录树（可多个根）→ 各目录 .imgtag。"""
+    jid = _new_job("export", "导出标签到 .imgtag（目录树）")
+
+    def run() -> dict:
+        targets: list[dict] = []
+        for fid in folder_ids:
+            targets.extend(_subtree_folders(fid))
+        total = len(targets) or 1
+        cb = _progress_cb(jid)
+        agg = {"dirs": 0, "media": 0, "written": 0, "failed": []}
+        for i, f in enumerate(targets, 1):
+            cb(i, total, "正在导出：" + (f.get("name") or f["path"]))
+            r = _export_one_dir(f["path"], f["id"])
+            if r["skipped"]:
+                continue
+            agg["dirs"] += 1
+            agg["media"] += r["media"]
+            agg["written"] += r["written"]
+            if r["error"]:
+                agg["failed"].append({"dir": f["path"], "error": r["error"]})
+        cb(total, total, "导出完成")
+        return agg
+
+    return _run_async(jid, run)
+
+
+def start_import(folder_id: int, overwrite: bool = False) -> str:
+    """后台导入：目录树各 .imgtag → 主库标签。"""
+    jid = _new_job("import", "从 .imgtag 导入标签")
+    return _run_async(jid, lambda: import_folder(folder_id, overwrite, _progress_cb(jid)))
+
+
+def start_selfcheck(folder_id: int) -> str:
+    """后台迁移自检：目录树内 主库 vs 磁盘 vs .imgtag 一致性。"""
+    jid = _new_job("selfcheck", "迁移自检（.imgtag）")
+    return _run_async(jid, lambda: self_check(folder_id, _progress_cb(jid)))
+
 

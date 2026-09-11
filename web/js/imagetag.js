@@ -7,16 +7,81 @@
  *   3. 迁移自检：核对 .imgtag 与磁盘/主库三方一致性（缺 .imgtag / 孤儿引用 / 未覆盖）。
  * ============================================================ */
 const Imagetag = {
+  _busy: false,       // 是否有 .imgtag 后台任务在进行
+  _pollTimer: null,
+
   init() {
     document.querySelectorAll("[data-close='imagetag-import-modal']").forEach(el => {
       el.onclick = () => document.getElementById("imagetag-import-modal").classList.add("hidden");
     });
     document.querySelectorAll("[data-close='imagetag-log-modal']").forEach(el => {
-      el.onclick = () => document.getElementById("imagetag-log-modal").classList.add("hidden");
+      el.onclick = () => {
+        document.getElementById("imagetag-log-modal").classList.add("hidden");
+        if (this._pollTimer) { clearTimeout(this._pollTimer); this._pollTimer = null; this._busy = false; }
+      };
     });
     document.getElementById("imagetag-import-cancel").onclick = () =>
       document.getElementById("imagetag-import-modal").classList.add("hidden");
     document.getElementById("imagetag-import-go").onclick = () => this.doImport();
+  },
+
+  /* ---------------- 进度弹窗 + 后台任务轮询 ---------------- */
+  _showProgress(title, text) {
+    document.getElementById("imagetag-log-title").textContent = title;
+    document.getElementById("imagetag-progress").classList.remove("hidden");
+    document.getElementById("imagetag-progress-bar").style.width = "0%";
+    document.getElementById("imagetag-progress-text").textContent = text || "准备中…";
+    document.getElementById("imagetag-log").innerHTML = "";
+    document.getElementById("imagetag-log-modal").classList.remove("hidden");
+  },
+
+  _updateProgress(job) {
+    const pct = Math.max(0, Math.min(100, job.progress || 0));
+    document.getElementById("imagetag-progress-bar").style.width = pct + "%";
+    document.getElementById("imagetag-progress-text").textContent =
+      (job.message || "") +
+      (job.total ? "  （" + (job.done || 0) + " / " + job.total + "）" : "");
+  },
+
+  /** 启动 .imgtag 后台任务并轮询进度；完成后回调 onDone(result)。 */
+  async _runJob(title, startFn, onDone) {
+    if (this._busy) { toast("已有任务在进行中，请稍候", "err"); return; }
+    this._busy = true;
+    this._showProgress(title, "正在启动…");
+    let jobId;
+    try {
+      const r = await startFn();
+      jobId = r && r.job_id;
+      if (!jobId) throw new Error("未返回任务 id");
+    } catch (e) {
+      this._busy = false;
+      this._openLog(title, '<div class="row err">启动失败：' + escapeHtml(e.message) + "</div>");
+      return;
+    }
+    const t0 = Date.now();
+    const tick = async () => {
+      let job;
+      try {
+        job = await API.get("/api/tags/jobs/" + jobId);
+      } catch (e) {
+        this._busy = false;
+        this._openLog(title, '<div class="row err">读取进度失败：' + escapeHtml(e.message) + "</div>");
+        return;
+      }
+      this._updateProgress(job);
+      if (job.status === "running") {
+        this._pollTimer = setTimeout(tick, Date.now() - t0 < 1500 ? 200 : 500);
+        return;
+      }
+      this._busy = false;
+      document.getElementById("imagetag-progress").classList.add("hidden");
+      if (job.status === "failed") {
+        this._openLog(title, '<div class="row err">失败：' + escapeHtml(job.error || "未知错误") + "</div>");
+        return;
+      }
+      onDone(job.result || {});
+    };
+    tick();
   },
 
   /* ---------------- 导出 ---------------- */
@@ -33,10 +98,9 @@ const Imagetag = {
       placeholder: "yes",
     });
     if (ok !== "yes") return;
-    try {
-      const res = await API.post("/api/tags/export", { scope_type: scope, scope_ids: ids });
-      this.showExportResult(res);
-    } catch (e) { toast("导出失败：" + e.message, "err"); }
+    this._runJob("导出到 .imgtag",
+      () => API.post("/api/tags/export", { scope_type: scope, scope_ids: ids }),
+      (res) => this.showExportResult(res));
   },
 
   /* ---------------- 导入 ---------------- */
@@ -51,26 +115,28 @@ const Imagetag = {
   async doImport() {
     const overwrite = document.getElementById("imagetag-import-overwrite").checked;
     document.getElementById("imagetag-import-modal").classList.add("hidden");
-    try {
-      const res = await API.post("/api/tags/import", { folder_id: App.state.currentFolderId, overwrite });
-      toast("导入完成：匹配 " + res.media + " 个媒体，新增 " + res.tags + " 个标签" +
-            (res.files ? "（读取 " + res.files + " 个 .imgtag）" : ""), "ok");
-      await Gallery.load(true);
-      await SidePanel.refresh();
-    } catch (e) { toast("导入失败：" + e.message, "err"); }
+    this._runJob("从 .imgtag 导入标签",
+      () => API.post("/api/tags/import", { folder_id: App.state.currentFolderId, overwrite }),
+      async (res) => {
+        toast("导入完成：匹配 " + (res.media || 0) + " 个媒体，新增 " + (res.tags || 0) + " 个标签" +
+              (res.files ? "（读取 " + res.files + " 个 .imgtag）" : ""), "ok");
+        await Gallery.load(true);
+        await SidePanel.refresh();
+      });
   },
 
   /* ---------------- 迁移自检 ---------------- */
   async selfCheck() {
     if (!App.state.currentFolderId) { toast("请在左侧选择一个目录再自检", "err"); return; }
-    try {
-      const res = await API.post("/api/tags/selfcheck", { folder_id: App.state.currentFolderId });
-      this.showSelfCheck(res);
-    } catch (e) { toast("自检失败：" + e.message, "err"); }
+    this._runJob("迁移自检",
+      () => API.post("/api/tags/selfcheck", { folder_id: App.state.currentFolderId }),
+      (res) => this.showSelfCheck(res));
   },
+
 
   /* ---------------- 结果展示 ---------------- */
   _openLog(title, html) {
+    document.getElementById("imagetag-progress").classList.add("hidden");
     document.getElementById("imagetag-log-title").textContent = title;
     document.getElementById("imagetag-log").innerHTML = html;
     document.getElementById("imagetag-log-modal").classList.remove("hidden");

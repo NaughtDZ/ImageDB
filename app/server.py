@@ -1069,15 +1069,12 @@ def create_app(config: AppConfig) -> FastAPI:
         """把标签导出到各目录的 .imgtag 侧车（不写主库，不碰媒体文件）。
 
         scope_type=media：按选中媒体导出；folder：整棵目录树每个目录各写一份。
+        **后台执行**：立即返回 {job_id}，前端轮询 /api/tags/jobs/{id} 显示进度。
         """
         if req.scope_type == "folder":
-            total = {"dirs": 0, "media": 0, "written": 0, "failed": []}
-            for fid in req.scope_ids:
-                r = imagetag_service.export_folder(fid)
-                for k in ("dirs", "media", "written"):
-                    total[k] += r[k]
-                total["failed"].extend(r.get("failed", []))
-            return total
+            if not req.scope_ids:
+                raise HTTPException(400, "未指定目录")
+            return {"job_id": imagetag_service.start_export_folders(req.scope_ids)}
         if req.scope_type == "media":
             if not req.scope_ids:
                 raise HTTPException(400, "未指定媒体")
@@ -1086,7 +1083,7 @@ def create_app(config: AppConfig) -> FastAPI:
                 ph = ",".join("?" * len(chunk))
                 rows.extend(query_all(
                     f"SELECT id, path, filename FROM media_items WHERE id IN ({ph})", chunk))
-            return imagetag_service.export_media(rows)
+            return {"job_id": imagetag_service.start_export_media(rows)}
         raise HTTPException(400, "scope_type 必须为 media 或 folder")
 
     @app.post("/api/tags/import")
@@ -1094,13 +1091,30 @@ def create_app(config: AppConfig) -> FastAPI:
         """从目录的 .imgtag 侧车导入标签回主库（source=import，可选覆盖）。
 
         按文件名匹配回库内媒体；数据仍以主库为准，.imgtag 仅供参考/迁移。
+        **后台执行**：立即返回 {job_id}，前端轮询进度。
         """
-        return imagetag_service.import_folder(req.folder_id, req.overwrite)
+        return {"job_id": imagetag_service.start_import(req.folder_id, req.overwrite)}
+
+    @app.get("/api/tags/jobs/{jid}")
+    def api_tags_job(jid: str) -> dict:
+        """查询 .imgtag 后台任务进度（含完成后的 result）。"""
+        job = imagetag_service.get_job(jid)
+        if job is None:
+            raise HTTPException(404, "任务不存在")
+        return job
+
+    @app.get("/api/tags/jobs")
+    def api_tags_jobs() -> dict:
+        """最近 .imgtag 任务列表（不含 result，避免过大）。"""
+        return {"jobs": imagetag_service.list_jobs()}
 
     @app.post("/api/tags/selfcheck")
     def api_tags_selfcheck(req: FolderIdRequest) -> dict:
-        """迁移前自检：目录树内 .imgtag 与磁盘/主库三方一致性（缺 .imgtag / 孤儿引用 / 未覆盖）。"""
-        return imagetag_service.self_check(req.folder_id)
+        """迁移前自检：目录树内 .imgtag 与磁盘/主库三方一致性（缺 .imgtag / 孤儿引用 / 未覆盖）。
+
+        **后台执行**：立即返回 {job_id}，前端轮询进度。
+        """
+        return {"job_id": imagetag_service.start_selfcheck(req.folder_id)}
 
     # ================= 打标 =================
     @app.get("/api/tagging/tools")
