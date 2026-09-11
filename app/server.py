@@ -299,7 +299,7 @@ def _media_to_dict(r: dict) -> dict:
 
 
 def search_media(folder_id: Optional[int] = None, q: str = "", dir_q: str = "",
-                 tags: str = "", tag_any: bool = False, type: str = "",
+                 tags: str = "", tag_any: bool = False, type: str = "", status: str = "",
                  page: int = 1, page_size: int = 60, sort: str = "name") -> dict:
     """
     媒体搜索/筛选：
@@ -307,6 +307,7 @@ def search_media(folder_id: Optional[int] = None, q: str = "", dir_q: str = "",
     - dir_q   ：按目录路径模糊匹配；
     - tags    ：按标签过滤（逗号分隔多个标签，默认取交集 AND，tag_any=True 取并集 OR）；
     - type    ：image / video / 空（全部）；
+    - status  ：空（全部）/ "missing"（只看丢失）/ "ok"（只看正常）；
     - folder_id：限定某目录及其子树。
     """
     where: list[str] = []
@@ -329,6 +330,11 @@ def search_media(folder_id: Optional[int] = None, q: str = "", dir_q: str = "",
     if type in ("image", "video"):
         where.append("m.type = ?")
         args.append(type)
+    # 丢失状态过滤（有 idx_media_status 索引，很快）
+    if status == "missing":
+        where.append("m.status = 'missing'")
+    elif status == "ok":
+        where.append("(m.status IS NULL OR m.status != 'missing')")
 
     # 标签过滤：支持空格 / 逗号 / 顿号混合分割，多个标签默认取交集（AND）。
     # 注意：标签名本身可能含空格（如 "long hair"），因此用 LIKE 包含匹配，
@@ -532,14 +538,16 @@ def create_app(config: AppConfig) -> FastAPI:
         tags: str = "",
         tag_any: bool = False,
         type: str = "",
+        status: str = "",
         page: int = Query(1, ge=1),
         page_size: int = Query(60, ge=1, le=200),
         sort: str = "name",
     ) -> dict:
-        """搜索/筛选媒体。"""
+        """搜索/筛选媒体。status='missing' 时只看丢失项。"""
         return search_media(
             folder_id=folder_id, q=q, dir_q=dir_q, tags=tags,
-            tag_any=tag_any, type=type, page=page, page_size=page_size, sort=sort,
+            tag_any=tag_any, type=type, status=status,
+            page=page, page_size=page_size, sort=sort,
         )
 
     @app.get("/api/media/{mid}")

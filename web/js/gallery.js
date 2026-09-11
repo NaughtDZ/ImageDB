@@ -62,6 +62,7 @@ const Gallery = {
     if (f.dir) params.set("dir_q", f.dir);
     if (f.tags) params.set("tags", f.tags);
     if (f.type) params.set("type", f.type);
+    if (f.status) params.set("status", f.status);   // 只看丢失
     params.set("page", App.state.page);
     params.set("page_size", App.state.pageSize);
     params.set("sort", document.getElementById("sort-select").value);
@@ -79,6 +80,7 @@ const Gallery = {
       this.updatePager();
       this.updateResultInfo();
       this.updateSelInfo();
+      App.updateMissingBadge();   // 「只看丢失」按钮的角标随范围/结果刷新
       this.scrollTop();
       this.saveBrowseState();
       // 3) 启动缩略图加载（视口内优先，异步），用 try/catch 保底——失败不影响 UI
@@ -89,13 +91,8 @@ const Gallery = {
         console.warn("缩略图加载启动异常（不影响浏览）：", e);
       }
     } catch (e) {
-      if (e.status === 410) {
-        toast("部分文件已被外部删除，记录已自动清理", "err");
-        TreeView.refresh();
-        this.load(reset);
-      } else {
-        toast("加载失败：" + e.message, "err");
-      }
+      // 注意：外部丢失不再自动删记录，后端也不会返回 410；这里只做一般错误提示
+      toast("加载失败：" + e.message, "err");
     }
   },
 
@@ -200,7 +197,9 @@ const Gallery = {
     const box = document.getElementById("gallery");
     box.innerHTML = "";
     if (!App.state.items.length) {
-      box.innerHTML = '<div class="empty">没有找到素材 —— 试试导入目录或调整筛选条件</div>';
+      box.innerHTML = App.state.filters.status === "missing"
+      ? '<div class="empty">当前范围没有「丢失」的媒体。<br>（提示：丢失是扫描出来的——可点顶栏「🔎 扫描丢失」或右键目录「重新扫描」）</div>'
+      : '<div class="empty">没有找到素材 —— 试试导入目录或调整筛选条件</div>';
       return;
     }
     for (const item of App.state.items) {

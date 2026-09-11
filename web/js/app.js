@@ -13,7 +13,8 @@ const App = {
     selected: new Set(),   // 选中的媒体 id 集合
     lastAnchor: null,      // 上次单击的媒体 id（Shift 区间选择的锚点）
     expandedFolders: new Set(),  // 目录树展开状态（展开的节点 id 集合）
-    filters: { q: "", dir: "", tags: "", type: "" },
+    filters: { q: "", dir: "", tags: "", type: "", status: "" },  // status="missing" = 只看丢失
+    missingTotal: 0,       // 全库被标记为丢失的媒体数（来自 /api/tree）
   },
 
   /** 应用初始化 */
@@ -75,6 +76,7 @@ const App = {
     document.getElementById("btn-export-tags").onclick = () => Imagetag.exportTags();
     document.getElementById("btn-import-tags").onclick = () => Imagetag.importTags();
     document.getElementById("btn-selfcheck-tags").onclick = () => Imagetag.selfCheck();
+    document.getElementById("btn-only-missing").onclick = () => this.toggleOnlyMissing();
     document.getElementById("btn-clear-sel").onclick = () => Gallery.clearSelection();
     document.getElementById("btn-delete-sel").onclick = () => this.deleteSelected();
     document.getElementById("btn-trash-sel").onclick = () => this.trashSelected();
@@ -98,7 +100,50 @@ const App = {
       // 标签搜索：空格/逗号分隔多个标签，AND 语义（后端处理）
       tags: document.getElementById("search-tags").value.trim(),
       type: document.getElementById("search-type").value,
+      status: this.state.filters.status || "",   // 保留「只看丢失」开关
     };
+    Gallery.load(true);
+  },
+
+  /** 当前范围内被标记为丢失的媒体数（用于「只看丢失」角标） */
+  missingCountInScope() {
+    const fid = this.state.currentFolderId;
+    if (!fid) return this.state.missingTotal || 0;
+    const find = (nodes) => {
+      for (const n of nodes) {
+        if (n.id === fid) return n;
+        const sub = find(n.children || []);
+        if (sub) return sub;
+      }
+      return null;
+    };
+    const node = find(this.state.tree || []);
+    if (!node) return 0;
+    let total = 0;
+    const sum = (n) => { total += (n.missing_count || 0); (n.children || []).forEach(sum); };
+    sum(node);
+    return total;
+  },
+
+  /** 刷新「只看丢失」按钮的激活态与角标 */
+  updateMissingBadge() {
+    const btn = document.getElementById("btn-only-missing");
+    if (!btn) return;
+    const active = this.state.filters.status === "missing";
+    btn.classList.toggle("active", active);
+    const n = this.missingCountInScope();
+    const cnt = document.getElementById("missing-count");
+    if (cnt) cnt.textContent = n > 0 ? String(n) : "";
+    btn.title = (active ? "已开启：只显示丢失项（点击关闭）" : "只看被标记为丢失的媒体") +
+                " · 当前范围 " + n + " 个";
+  },
+
+  /** 切换「只看丢失项」 */
+  toggleOnlyMissing() {
+    const on = this.state.filters.status === "missing";
+    this.state.filters.status = on ? "" : "missing";
+    this.state.page = 1;
+    this.updateMissingBadge();
     Gallery.load(true);
   },
 

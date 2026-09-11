@@ -462,6 +462,15 @@ body.selecting { user-select: none; cursor: crosshair; }
 }
 .tree-node.missing .label { color: var(--danger); }
 .tree-node.offline .label { color: var(--text-dim); font-style: italic; }
+/* ---------- 「只看丢失」开关 ---------- */
+#btn-only-missing.active { background: #c0392b; border-color: #c0392b; color: #fff; }
+#btn-only-missing .cnt {
+  display: inline-block; margin-left: 5px; padding: 0 5px;
+  background: rgba(255, 255, 255, .22); border-radius: 8px; font-size: 11px; line-height: 16px;
+}
+#btn-only-missing .cnt:empty { display: none; }
+#btn-only-missing.active .cnt { background: rgba(0, 0, 0, .28); }
+
 .tree-node .count .miss { color: var(--danger); }
 
 

@@ -14,7 +14,9 @@ const TreeView = {
     try {
       const data = await API.get("/api/tree");
       App.state.tree = data.tree || [];
+      App.state.missingTotal = data.missing_total || 0;
       this.render();
+      App.updateMissingBadge();   // 同步「只看丢失」角标
     } catch (e) {
       toast("加载目录树失败：" + e.message, "err");
     }
