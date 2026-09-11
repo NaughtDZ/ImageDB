@@ -10,8 +10,8 @@ API 概览：
     POST   /api/library/import            导入目录
     POST   /api/library/rescan            重新扫描目录
     POST   /api/library/remove            从库中移除目录
-    POST   /api/library/verify            全库缺失校验（自动清理）
-    POST   /api/library/check             检查单个目录是否存在
+    POST   /api/library/recheck_missing   恢复校验（只把误标的丢失恢复回正常）
+    POST   /api/library/check             只读检查单个目录是否存在（不改库）
     GET    /api/media                     搜索/筛选媒体（文件名/目录名/标签/类型）
     GET    /api/media/{id}                媒体详情
     GET    /api/media/{id}/file           流式读取原文件（支持视频 Range 拖动）
@@ -423,21 +423,37 @@ def _maybe_cleanup_thumbs() -> None:
 _thumb_clean_counter = 0
 
 
-def _require_media(mid: int, auto_clean: bool = True) -> dict:
+def _require_media(mid: int, mark_missing: bool = False) -> dict:
     """查询媒体记录，并把「文件是否还在磁盘上」同步到 status（**绝不删除记录**）。
 
-    - 文件在 → status='ok'（之前若为 missing 会自动恢复）；
-    - 文件不在 → status='missing'（保留记录/标签/缩略图；外部丢失不销毁数据）。
+    三态原则（只会「恢复」，不会因为一次读失败就误标）：
+    - 确认在 → status='ok'（若之前是 missing 会自动恢复，并记审计原因）；
+    - 确认不在 → **只有 mark_missing=True 才标记**；被动请求（缩略图/原图/详情）
+      默认不标记，丢失标记只由用户显式重扫（library.rescan_folder）产生；
+    - 读不到（权限/网络/盘掉线，'unknown'）→ 保持原状态，绝不写库。
+
     调用方应根据 row["status"] 决定响应（缺失时给占位图/提示，而不是删库）。
-    auto_clean 参数保留仅为兼容旧调用，已不再触发任何删除。
     """
     row = query_one("SELECT * FROM media_items WHERE id = ?", (mid,))
     if row is None:
         raise HTTPException(404, "记录不存在")
-    want = "ok" if os.path.isfile(row["path"]) else "missing"
-    if (row["status"] or "ok") != want:
-        execute("UPDATE media_items SET status = ? WHERE id = ?", (want, mid))
-        row["status"] = want
+    state = library.probe_file(row["path"])
+    cur = row["status"] or "ok"
+    if state == "present":
+        if cur != "ok":
+            execute(
+                "UPDATE media_items SET status = 'ok',"
+                " status_at = datetime('now','localtime'), status_reason = ? WHERE id = ?",
+                ("access:present", mid),
+            )
+            row["status"] = "ok"
+    elif state == "absent" and mark_missing and cur != "missing":
+        execute(
+            "UPDATE media_items SET status = 'missing',"
+            " status_at = datetime('now','localtime'), status_reason = ? WHERE id = ?",
+            ("access:not_found", mid),
+        )
+        row["status"] = "missing"
     return row
 
 
@@ -452,17 +468,9 @@ def create_app(config: AppConfig) -> FastAPI:
                     app_version.short_label(), _vi.get("code_mtime"), _vi.get("started_at"))
         # 启动：初始化打标插件管理器
         tagging_manager.init_manager(lambda: config)
-        # 启动后台校验线程（只把外部丢失的媒体标记为 missing，绝不删记录）
-        interval = config.get_int("verify_interval_sec", 60)
-        if interval > 0:
-            def verify_loop() -> None:
-                while not stop_event.wait(interval):
-                    try:
-                        library.verify_all()
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("后台校验异常：%s", exc)
-            threading.Thread(target=verify_loop, daemon=True, name="verify-loop").start()
-            logger.info("后台校验线程已启动（间隔 %d 秒）", interval)
+        # 不再启动任何后台/定时的全库校验线程。
+        # 原则：程序只做「恢复」，绝不定时批量标记丢失；「丢失」只能由用户在
+        # 侧边栏显式重扫某个目录后确认（POST /api/library/rescan）。
         yield
         stop_event.set()
 
@@ -518,15 +526,23 @@ def create_app(config: AppConfig) -> FastAPI:
         """把目录从库中移除（不影响磁盘文件）。"""
         return {"removed_media": library.remove_folder(req.folder_id)}
 
-    @app.post("/api/library/verify")
-    def api_verify() -> dict:
-        """全库扫描（**只标记不删**）：把磁盘上已不存在的媒体标记为 missing。"""
-        return library.verify_all()
-
     @app.post("/api/library/check")
     def api_check(req: FolderIdRequest) -> dict:
-        """检查单个目录是否仍存在（点击树节点时调用）；不存在只标记 missing，不删记录。"""
+        """检查单个目录是否仍存在（点击树节点时调用）：**只读探测，绝不改库**。
+
+        目录读不到（网络/权限）时返回 unknown=True，视作「还在」，不会误报丢失。
+        """
         return library.check_folder(req.folder_id)
+
+    @app.post("/api/library/recheck_missing")
+    def api_recheck_missing(req: FolderIdRequest) -> dict:
+        """恢复校验（**只恢复、不标记、不删除**）：把标记为丢失但实际还在的记录标回 ok。
+
+        folder_id 为 0/缺省时校验全库的丢失记录；通常只有几十条，秒级完成。
+        返回 {checked, recovered, still_missing, unknown}。
+        """
+        fid = req.folder_id or None
+        return library.recheck_missing(fid)
 
     @app.post("/api/library/purge_missing")
     def api_purge_missing(req: FolderIdRequest) -> dict:
@@ -557,7 +573,7 @@ def create_app(config: AppConfig) -> FastAPI:
     @app.get("/api/media/{mid}")
     def api_media_detail(mid: int) -> dict:
         """媒体详情（含标签）。"""
-        row = _require_media(mid, auto_clean=False)
+        row = _require_media(mid)
         d = _media_to_dict(row)
         for t in query_all(
             """SELECT t.name, mt.confidence, mt.source FROM media_tags mt
@@ -573,7 +589,7 @@ def create_app(config: AppConfig) -> FastAPI:
 
         只读取文件本身，不写入数据库；文件缺失/解析失败时返回空段。
         """
-        row = _require_media(mid, auto_clean=False)
+        row = _require_media(mid)
         m = media_metadata.extract_metadata(row["path"], row["type"])
         return {"id": mid, "filename": row["filename"], "type": row["type"],
                 "basic": m["basic"], "exif": m["exif"], "iptc": m["iptc"], "xmp": m["xmp"]}
@@ -814,24 +830,29 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @app.get("/api/media/{mid}/file")
     def api_media_file(mid: int):
-        """流式读取原文件（FileResponse 支持视频 Range 拖动）。文件外部丢失时返回 404（含路径）。"""
+        """流式读取原文件（FileResponse 支持视频 Range 拖动）。
+
+        读不到源文件时**现场**返回 404 + 具体路径（不写库、不改状态）：
+        文件确认不在 → 「图片路径已丢失：…」；网络/权限读不到 → 「暂时无法访问：…」。
+        """
         row = _require_media(mid)
-        if row["status"] == "missing":
+        state = library.probe_file(row["path"])
+        if state == "absent":
             raise HTTPException(404, f"图片路径已丢失：{row['path']}")
+        if state == "unknown":
+            raise HTTPException(404, f"暂时无法访问（网络/权限）：{row['path']}")
         return FileResponse(row["path"], filename=row["filename"])
 
     @app.get("/api/media/{mid}/thumbnail")
     def api_media_thumbnail(mid: int, regenerate: bool = False):
-        """缩略图：已存在直接返回，否则自动生成（视频取指定秒数的帧）。
+        """缩略图：**缓存优先**，没有缓存才现场生成；真读不到源文件时给内置占位图。
 
-        文件外部丢失（status=missing）时返回**内置占位图**，不删记录、不报错。
+        文件被外部删掉、但缓存缩略图还在时，照常返回缓存图（前端按 status 显示
+        「丢失」角标），这样你还能看到那张图长什么样，而不是只剩一个红叉。
+        全程**只做恢复、不标记丢失**，也绝不删记录。
         """
-        row = _require_media(mid)
-        if row["status"] == "missing":
-            ph = media_service.placeholder_thumb_path()
-            if ph:
-                return FileResponse(ph)
-            raise HTTPException(404, f"图片路径已丢失：{row['path']}")
+        row = _require_media(mid)     # 只恢复，不标记
+        # 1. 缓存缩略图（存在就直接给，不论源文件是否还在）
         if row["thumbnail"] and not regenerate:
             abs_path = os.path.join(DATA_DIR, row["thumbnail"])
             if os.path.isfile(abs_path):
@@ -841,6 +862,13 @@ def create_app(config: AppConfig) -> FastAPI:
                     pass
                 _maybe_cleanup_thumbs()
                 return FileResponse(abs_path)
+        # 2. 已确认丢失且无缓存 → 占位图（不再空跑一次生成）
+        if row["status"] == "missing":
+            ph = media_service.placeholder_thumb_path()
+            if ph:
+                return FileResponse(ph)
+            raise HTTPException(404, f"图片路径已丢失：{row['path']}")
+        # 3. 现场生成
         cfg = config
         media_service.make_thumbnail(
             mid, row["path"], row["type"],
@@ -852,14 +880,21 @@ def create_app(config: AppConfig) -> FastAPI:
             abs_path = os.path.join(DATA_DIR, row2["thumbnail"])
             if os.path.isfile(abs_path):
                 return FileResponse(abs_path)
+        # 4. 生成失败（源文件读不到/损坏）→ 占位图，不写库
+        ph = media_service.placeholder_thumb_path()
+        if ph:
+            return FileResponse(ph)
         raise HTTPException(500, "缩略图生成失败（可能需要安装 Pillow / OpenCV）")
 
     @app.get("/api/media/{mid}/frames")
     def api_media_frames(mid: int, interval: Optional[float] = None):
-        """视频抽帧（供打标预览），返回帧图 URL 列表。"""
+        """视频抽帧（供打标预览），返回帧图 URL 列表。读不到源文件时现场 404，不写库。"""
         row = _require_media(mid)
-        if row["status"] == "missing":
+        state = library.probe_file(row["path"])
+        if state == "absent":
             raise HTTPException(404, f"文件路径已丢失：{row['path']}")
+        if state == "unknown":
+            raise HTTPException(404, f"暂时无法访问（网络/权限）：{row['path']}")
         if row["type"] != "video":
             raise HTTPException(400, "仅视频支持抽帧")
         cfg = config
@@ -878,7 +913,7 @@ def create_app(config: AppConfig) -> FastAPI:
     @app.post("/api/media/{mid}/tags")
     def api_add_tags(mid: int, req: TagListRequest) -> dict:
         """手动添加标签（source=manual）。"""
-        row = _require_media(mid, auto_clean=False)
+        row = _require_media(mid)
         added = 0
         for name in req.tags:
             name = (name or "").strip()
@@ -896,7 +931,7 @@ def create_app(config: AppConfig) -> FastAPI:
     @app.post("/api/media/{mid}/tags/remove")
     def api_remove_tags(mid: int, req: TagListRequest) -> dict:
         """移除标签（任意来源）。"""
-        row = _require_media(mid, auto_clean=False)
+        row = _require_media(mid)
         removed = 0
         for name in req.tags:
             tag_row = query_one("SELECT id FROM tags WHERE name = ?", (name,))

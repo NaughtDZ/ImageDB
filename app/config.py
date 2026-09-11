@@ -25,8 +25,6 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 # 配置默认值（键 → 默认值字符串）
 DEFAULTS: dict[str, str] = {
     "port": "8000",                     # HTTP 服务端口
-    "verify_interval_sec": "0",         # 后台自动「标记丢失」间隔（秒）；0=关闭（推荐，避免网络盘/大库被持续全量重扫）
-                                        # 想自动发现可设 600~1800；日常靠「浏览时按需检测 + 手动扫描」
     "proxy_enabled": "false",           # 是否启用代理
     "proxy_type": "http",               # 代理类型：http / socks5（socks 需要额外依赖）
     "proxy_host": "",                   # 代理主机
@@ -77,28 +75,8 @@ class AppConfig:
             row = query_one("SELECT value FROM settings WHERE key = ?", (key,))
             if row is None:
                 execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, value))
-        self._migrate_verify_interval()
         self._cache: dict[str, str] = {}
         self.reload()
-
-    def _migrate_verify_interval(self) -> None:
-        """一次性迁移：旧版默认 verify_interval_sec=60（每 60 秒全量重扫全部目录，
-        对网络盘/大库开销过大）。若用户从未改过（仍是旧默认 60），改为新默认 0（关闭定时全扫）。
-        用 settings 里的标记位保证只执行一次；用户手动改过的值不会被覆盖。
-        """
-        try:
-            marker = query_one("SELECT value FROM settings WHERE key = ?", ("verify_interval_migrated",))
-            if marker is not None:
-                return
-            row = query_one("SELECT value FROM settings WHERE key = ?", ("verify_interval_sec",))
-            if row is not None and str(row["value"]).strip() == "60":
-                execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
-                        ("verify_interval_sec", "0"))
-                logger.info("后台校验间隔已从旧默认 60 秒迁移为 0（关闭定时全扫）")
-            execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
-                    ("verify_interval_migrated", "1"))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("校验间隔迁移失败：%s", exc)
 
     def reload(self) -> None:
         """从数据库重新加载全部设置到内存缓存。"""

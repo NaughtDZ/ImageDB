@@ -37,7 +37,7 @@
   <div class="actions">
     <button id="btn-import" class="btn primary">＋ 导入目录</button>
     <button id="btn-rescan" class="btn" title="重新扫描当前目录">⟳ 重新扫描</button>
-    <button id="btn-verify" class="btn" title="全库扫描：把已丢失的文件标记为「丢失」（不删记录）">🔎 扫描丢失</button>
+    <button id="btn-recheck-missing" class="btn" title="把被标记为丢失、但实际还在磁盘上的文件恢复回正常（只恢复，不标记、不删除）">♻ 恢复校验</button>
     <button id="btn-settings" class="btn" title="代理 / 打标 / 视频 / 模型下载">⚙ 设置</button>
   </div>
 </header>
@@ -308,11 +308,12 @@
           <div class="hint">0 = 不限制；超限时自动清理最久未访问的缩略图（LRU）。
             默认 200MB ≈ 数千张缩略图，比 1GB 更合理。首次点击素材时生成缩略图，
             生成过就保留，翻回已访问页会从缓存快速读取。</div>
-        <div class="form-row"><label>后台自动标记丢失间隔（秒，0=关闭）</label>
-          <input id="set-verify-interval" type="number" min="0" value="0"></div>
-        <div class="hint">默认 <b>0（关闭）</b>：定时全量重扫对网络盘/大库开销很大。<br>
-          日常靠<b>浏览时按需检测</b>（翻到哪张就检查哪张）+ 手动「🔎 扫描丢失」/右键「重新扫描」。<br>
-          想要自动发现可设为 600~1800（10~30 分钟），代价是持续的后台磁盘扫描。</div>
+        <div class="hint"><b>丢失是怎么判定的：</b>程序<b>永不</b>自动、定时、批量地把文件标记为「丢失」，
+          也<b>永不</b>静默删除记录。<br>
+          只有你在侧边栏手动「⟳ 重新扫描」某个目录时，才会核对磁盘：确认不在的才算丢失，
+          然后弹窗问你是否从数据库删除（不删则保留记录/标签/缩略图）。<br>
+          平时浏览 / 生成缩略图只做<b>只读探测</b>：读得到就顺手把「丢失」恢复成正常；
+          读不到（文件被外部删了）就现场显示占位图或提示「路径已丢失」，<b>不动数据库</b>。</div>
       </div>
 
       <!-- 模型下载 -->

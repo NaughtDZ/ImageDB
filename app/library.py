@@ -424,25 +424,6 @@ def _root_of(folder_id: int) -> int | None:
     return None
 
 
-def _folder_root_map() -> tuple[dict[int, int | None], dict[int, str]]:
-    """一次查库得到 ({folder_id: root_id}, {folder_id: path})，供全库校验用。"""
-    rows = query_all("SELECT id, parent_id, is_root, path FROM folders")
-    parent = {r["id"]: r["parent_id"] for r in rows}
-    isroot = {r["id"]: bool(r["is_root"]) for r in rows}
-    paths = {r["id"]: r["path"] for r in rows}
-    out: dict[int, int | None] = {}
-    for fid in parent:
-        cur: int | None = fid
-        seen: set[int] = set()
-        while cur is not None and cur not in seen:
-            seen.add(cur)
-            if isroot.get(cur):
-                break
-            cur = parent.get(cur)
-        out[fid] = cur
-    return out, paths
-
-
 def root_offline(root_id: int) -> bool:
     """根目录是否不可达（盘没挂/被拔/目录被删）→ 视为「离线」，此时不做丢失标记。
 
@@ -461,50 +442,94 @@ def _count_media_in(folder_ids: list[int]) -> int:
     return row["c"] if row else 0
 
 
-# ---------------- 丢失标记（外部丢失不删记录） ----------------
-def _mark_all_missing(folder_ids: list[int]) -> int:
-    """把若干目录下的所有媒体标记为 missing（**不删除**）。返回被标记的数量。"""
+# ---------------- 丢失判定：三态（present / absent / unknown） ----------------
+# 核心原则：**只有「确认不存在」才允许标记丢失**。
+# 权限不足、网络抖动、盘掉线等一律算 'unknown'（未知）→ 不写库、不改状态。
+# 历史教训：旧代码用 os.path.isfile() 判定，它会把任何异常都吞成 False，
+# 于是「读不到」被当成「文件没了」，浏览一遍就会把好文件误标为丢失。
+
+
+def probe_file(path: str) -> str:
+    """文件三态：'present'（在）/ 'absent'（确认不在）/ 'unknown'（读不到，无法确认）。"""
+    try:
+        os.stat(path)
+        return "present"
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unknown"
+
+
+def probe_dir(path: str) -> str:
+    """目录三态：'present' / 'absent' / 'unknown'（含义同上）。"""
+    try:
+        os.stat(path)
+        return "present"
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unknown"
+
+
+def _mark_all_missing(folder_ids: list[int], reason: str = "mark") -> int:
+    """把若干目录下的所有媒体标记为 missing（**不删除记录**）。返回被标记的数量。
+
+    仅用于「目录确认不存在」这种明确情形（重扫时发现目录没了）。
+    """
     if not folder_ids:
         return 0
     n = 0
     for chunk in chunk_ids(folder_ids):
         ph = ",".join("?" * len(chunk))
         n += execute_rowcount(
-            "UPDATE media_items SET status = 'missing'"
+            "UPDATE media_items SET status = 'missing',"
+            " status_at = datetime('now','localtime'), status_reason = ?"
             f" WHERE folder_id IN ({ph}) AND (status IS NULL OR status != 'missing')",
-            chunk,
+            [reason] + list(chunk),
         )
     return n
 
 
-def _sync_dir_status(folder_db_id: int, dir_path: str) -> tuple[int, int]:
-    """按磁盘实际文件名，把该目录下媒体记录在 ok/missing 间同步（**不删除**）。
-    返回 (新标记为 missing 数, 恢复为 ok 数)。"""
+def _sync_dir_status(folder_db_id: int, dir_path: str, reason: str = "rescan:not_found"
+                     ) -> tuple[int, int, int]:
+    """按磁盘实际目录项，把该目录下媒体在 ok/missing 间同步（**不删除记录**）。
+
+    返回 (新标记为 missing 数, 恢复为 ok 数, 是否未知)。
+    目录读不到（scandir 抛 OSError）→ 返回 (0, 0, 1)，**一条都不标记**。
+    用 scandir 目录项比对而不是 os.path.isfile：天然区分「读不到目录」与「文件不在」。
+    """
     try:
         on_disk = {e.name for e in os.scandir(dir_path)}
     except OSError:
-        return 0, 0
+        return 0, 0, 1
     miss = 0
     ok = 0
     for item in query_all("SELECT id, filename, status FROM media_items WHERE folder_id = ?",
                           (folder_db_id,)):
         want = "ok" if item["filename"] in on_disk else "missing"
         if (item["status"] or "ok") != want:
-            execute("UPDATE media_items SET status = ? WHERE id = ?", (want, item["id"]))
+            execute(
+                "UPDATE media_items SET status = ?,"
+                " status_at = datetime('now','localtime'), status_reason = ? WHERE id = ?",
+                (want, reason if want == "missing" else "rescan:present", item["id"]),
+            )
             if want == "missing":
                 miss += 1
             else:
                 ok += 1
-    return miss, ok
+    return miss, ok, 0
 
 
 def rescan_folder(folder_id: int) -> dict:
-    """重新扫描某个目录子树（**只标记、不删除**）：
+    """重新扫描某个目录子树（**用户显式操作** / 只标记、不删除）：
     - 磁盘上新增的目录/媒体 → 补录；
     - 磁盘上已消失的媒体 → 标记 status='missing'（保留记录/标签/缩略图）；
     - 之前 missing 现在又出现的 → 标回 'ok'；
-    - 目录本身消失 → 其下媒体全部标记 missing（不删目录、不删记录）。
-    返回 {added, missing, recovered, dir_missing}。
+    - 目录本身确认不存在 → 其下媒体全部标记 missing（不删目录、不删记录）；
+    - **目录读不到（权限/网络/盘掉线）→ 计为 dirs_unknown，一条都不标记**。
+
+    这是**唯一**会把记录标记为丢失的地方（另一处是用户主动删除）。
+    返回 {added, missing, recovered, dir_missing, root_offline, dirs_unknown}。
     真正删除记录请用 purge_missing()（用户显式确认后）。
     """
     folder = query_one("SELECT * FROM folders WHERE id = ?", (folder_id,))
@@ -514,33 +539,44 @@ def rescan_folder(folder_id: int) -> dict:
     # 根目录不可达（盘没挂/被拔）→ 视为「离线」，不做任何标记
     rid = _root_of(folder_id)
     if rid is not None and root_offline(rid):
-        return {"added": 0, "missing": 0, "recovered": 0,
-                "dir_missing": True, "root_offline": True}
-    if not os.path.isdir(folder["path"]):
-        missing = _mark_all_missing(_subtree_folder_ids(folder_id))
-        return {"added": 0, "missing": missing, "recovered": 0,
+        return {"added": 0, "missing": 0, "recovered": 0, "dirs_unknown": 0,
+                "dir_missing": False, "root_offline": True}
+    state = probe_dir(folder["path"])
+    if state == "unknown":
+        # 读不到 ≠ 不存在：不标记、不补录，交由用户稍后重试
+        return {"added": 0, "missing": 0, "recovered": 0, "dirs_unknown": 1,
+                "dir_missing": False, "root_offline": False}
+    if state == "absent":
+        missing = _mark_all_missing(_subtree_folder_ids(folder_id), "rescan:dir_missing")
+        return {"added": 0, "missing": missing, "recovered": 0, "dirs_unknown": 0,
                 "dir_missing": True, "root_offline": False}
 
     # 1. 补录磁盘上新增的目录与媒体
     seen: set[str] = {os.path.realpath(folder["path"])}
     _fa, added = _walk_and_insert(folder["path"], folder_id, seen)
 
-    # 2. 逐目录同步 ok/missing（不删任何记录）
+    # 2. 逐目录同步 ok/missing（不删任何记录；读不到的目录跳过）
     missing = 0
     recovered = 0
+    unknown = 0
     for f in _subtree_folder_ids(folder_id):
         frow = query_one("SELECT path FROM folders WHERE id = ?", (f,))
         if not frow:
             continue
-        if not os.path.isdir(frow["path"]):
-            missing += _mark_all_missing([f])
+        st = probe_dir(frow["path"])
+        if st == "unknown":
+            unknown += 1
             continue
-        m, o = _sync_dir_status(f, frow["path"])
+        if st == "absent":
+            missing += _mark_all_missing([f], "rescan:dir_missing")
+            continue
+        m, o, u = _sync_dir_status(f, frow["path"])
         missing += m
         recovered += o
+        unknown += u
 
     return {"added": added, "missing": missing, "recovered": recovered,
-            "dir_missing": False, "root_offline": False}
+            "dirs_unknown": unknown, "dir_missing": False, "root_offline": False}
 
 
 def purge_missing(folder_id: int) -> dict:
@@ -571,54 +607,77 @@ def purge_missing(folder_id: int) -> dict:
     return {"removed": removed}
 
 
-def verify_all() -> dict:
-    """全库扫描（**只标记、不删除**）：磁盘上已不存在的媒体 → status='missing'；
-    重新出现的 → 标回 'ok'。**绝不删除任何数据库记录**。
-
-    根目录不可达（盘没挂/被拔）时**整棵跳过**，只记入 offline_roots——
-    避免「拔盘 → 几十万条被误标丢失」。
-    返回 {missing, recovered, dirs_missing, offline_roots}。
-    """
-    invalidate_root_cache()   # 手动/定时扫描：重新探测根目录
-    rmap, paths = _folder_root_map()
-    reach: dict[int, bool] = {}
-    for rid in {v for v in rmap.values() if v is not None}:
-        reach[rid] = _isdir_fast(paths.get(rid, ""))
-    offline_roots = [paths[r] for r, ok in reach.items() if not ok]
-
-    missing = 0
-    recovered = 0
-    dirs_missing = 0
-    for fid, rid in rmap.items():
-        if rid is not None and not reach.get(rid, True):
-            continue   # 所在根离线 → 不标记
-        p = paths.get(fid, "")
-        if not os.path.isdir(p):
-            dirs_missing += 1
-            missing += _mark_all_missing([fid])
-            continue
-        m, o = _sync_dir_status(fid, p)
-        missing += m
-        recovered += o
-    return {"missing": missing, "recovered": recovered,
-            "dirs_missing": dirs_missing, "offline_roots": offline_roots}
-
-
 def check_folder(folder_id: int) -> dict:
-    """校验单个目录（用户点击树节点时调用）：
-    - 所在根目录不可达 → 视为「离线」，不标记、只返回 root_offline=True；
-    - 目录本身不存在（根可达）→ 只把其下媒体标记 missing（**绝不删记录**）。
+    """校验单个目录（用户点击树节点时调用）：**只报告、绝不改库**。
+
+    - 所在根目录不可达 → root_offline=True；
+    - 目录确认不存在 → exists=False（**不标记任何记录**，丢失标记只由重扫产生）；
+    - 目录读不到（权限/网络）→ unknown=True，视作还在，避免误报「目录已丢失」。
     """
     folder = query_one("SELECT * FROM folders WHERE id = ?", (folder_id,))
     if not folder:
-        return {"exists": False, "missing": 0, "root_offline": False}
+        return {"exists": False, "missing": 0, "root_offline": False, "unknown": False}
     rid = _root_of(folder_id)
     if rid is not None and root_offline(rid):
-        return {"exists": False, "missing": 0, "root_offline": True}
-    if not os.path.isdir(folder["path"]):
-        n = _mark_all_missing(_subtree_folder_ids(folder_id))
-        return {"exists": False, "missing": n, "root_offline": False}
-    return {"exists": True, "missing": 0, "root_offline": False}
+        return {"exists": False, "missing": 0, "root_offline": True, "unknown": False}
+    state = probe_dir(folder["path"])
+    if state == "unknown":
+        return {"exists": True, "missing": 0, "root_offline": False, "unknown": True}
+    return {"exists": state == "present", "missing": 0,
+            "root_offline": False, "unknown": False}
+
+
+def recheck_missing(folder_id: int | None = None) -> dict:
+    """把「标记为丢失、但实际还在」的记录恢复回 ok（**只恢复，不标记、不删除**）。
+
+    只遍历 status='missing' 的记录（当前库里通常只有几十条），按目录聚合后
+    每个目录只做一次 scandir，因此即使丢失记录很多也是秒级。
+    目录读不到（权限/网络）→ 计入 unknown，保持原状态，绝不误判。
+    返回 {checked, recovered, still_missing, unknown}。
+    """
+    if folder_id is None:
+        rows = query_all(
+            "SELECT id, path, filename FROM media_items WHERE status = 'missing'")
+    else:
+        ids = _subtree_folder_ids(folder_id)
+        rows = []
+        for chunk in chunk_ids(ids):
+            ph = ",".join("?" * len(chunk))
+            rows.extend(query_all(
+                "SELECT id, path, filename FROM media_items"
+                f" WHERE status = 'missing' AND folder_id IN ({ph})", chunk))
+    if not rows:
+        return {"checked": 0, "recovered": 0, "still_missing": 0, "unknown": 0}
+
+    by_dir: dict[str, list] = {}
+    for r in rows:
+        by_dir.setdefault(os.path.dirname(r["path"]), []).append(r)
+
+    recovered = 0
+    still = 0
+    unknown = 0
+    for d, items in by_dir.items():
+        try:
+            names: set[str] | None = {e.name for e in os.scandir(d)}
+        except OSError:
+            names = None      # 读不到目录 → 未知，一个都不动
+        if names is None:
+            unknown += len(items)
+            continue
+        for it in items:
+            if it["filename"] in names:
+                execute(
+                    "UPDATE media_items SET status = 'ok',"
+                    " status_at = datetime('now','localtime'), status_reason = ? WHERE id = ?",
+                    ("recheck:recovered", it["id"]),
+                )
+                recovered += 1
+            else:
+                still += 1
+    logger.info("恢复校验：检查 %d 条，恢复 %d 条，仍缺失 %d 条，无法确认 %d 条",
+                len(rows), recovered, still, unknown)
+    return {"checked": len(rows), "recovered": recovered,
+            "still_missing": still, "unknown": unknown}
 
 def remove_folder(folder_id: int) -> int:
     """
@@ -647,7 +706,8 @@ def remove_folder(folder_id: int) -> int:
 def remove_media_item(media_id: int) -> bool:
     """从库中删除单个媒体记录（仅在**用户显式删除**时调用），并同步清理缩略图文件。
 
-    注意：文件被外部删除时**不要**调用本函数——那只会把 status 标记为 missing（见 verify_all）。
+    注意：文件被外部删除时**不要**调用本函数——那只会把 status 标记为 missing。
+    外部丢失的判定只发生在用户显式重扫（rescan_folder）时，且需确认目录可读。
     """
     try:
         from . import media as media_service
@@ -691,7 +751,8 @@ def build_tree() -> dict:
             "media_count": count_map.get(f["id"], 0),
             # 目录本身是否还在磁盘上：**这里绝不做磁盘检查**（否则 5000+ 目录每个一次 isdir，
             # 网络盘上就是十几秒）。统一在下面 _walk 里按根目录可达性推断；
-            # 单目录被删的情形等用户点击该节点时按需判定（check_folder）。
+            # 单目录是否真的被删，只在用户点击节点时做一次只读探测（check_folder，不改库），
+            # 真正的「丢失标记」只由用户显式重扫（rescan_folder）产生。
             "missing": False,
             # 该目录下被标记为丢失的媒体数
             "missing_count": miss_map.get(f["id"], 0),
@@ -710,7 +771,7 @@ def build_tree() -> dict:
     # 性能要点：目录树必须保持「纯数据库读取」，**绝不逐目录 stat**。
     # 网络盘上 5000+ 个目录各来一次 isdir 会让启动/加载目录树慢十几秒。
     # 因此这里只在「根目录」上做可达性检查（通常 1~2 个根 = 1~2 次 stat），
-    # 再向下传播 offline 标记；单目录是否被删改成点击该节点时按需判定（见 check_folder）。
+    # 再向下传播 offline 标记；单目录是否被删改成点击该节点时做只读探测（见 check_folder，绝不改库）。
     def _walk(node: dict, offline: bool) -> None:
         node["offline"] = offline
         node["missing"] = False   # 启动时不逐个 stat；点击时按需判定

@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS media_items (
     duration    REAL,                          -- 视频时长（秒）
     thumbnail   TEXT,                          -- 缩略图相对路径（如 thumbs/123.jpg）
     status      TEXT    DEFAULT 'ok',          -- 'ok' / 'missing'（异常标记）
+    status_at   TEXT,                          -- 状态最后一次变更时间（审计：「什么时候被标的丢失」）
+    status_reason TEXT,                        -- 状态变更原因（审计，如 rescan:not_found / access:present）
     created_at  TEXT    DEFAULT (datetime('now','localtime')),
     FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE CASCADE
 );
@@ -155,13 +157,38 @@ def ensure_dirs() -> None:
         os.makedirs(d, exist_ok=True)
 
 
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """给老库补列（幂等、只加列不删改，可回滚）。
+
+    SQLite 的 ADD COLUMN 是纯元数据操作，不重写表、不建索引，
+    对 37 万行的 media_items 也是毫秒级，不影响读写性能。
+    只对缺失的库执行一次。
+    """
+    want = {
+        "media_items": {
+            "status_at": "TEXT",      # 状态最后一次变更时间
+            "status_reason": "TEXT",  # 状态变更原因（审计）
+        },
+    }
+    for table, cols in want.items():
+        try:
+            have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        except sqlite3.Error:
+            continue
+        for col, decl in cols.items():
+            if col not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+                logger.info("数据库补列：%s.%s", table, col)
+
+
 def init_schema() -> None:
-    """建表（幂等，可重复调用）。"""
+    """建表 + 补列（幂等，可重复调用）。"""
     ensure_dirs()
     with _write_lock:
         conn = _connect()
         try:
             conn.executescript(SCHEMA)
+            _ensure_columns(conn)
             conn.commit()
         finally:
             conn.close()

@@ -47,6 +47,20 @@ const Viewer = {
     const video = document.getElementById("viewer-video");
     const hint = document.getElementById("viewer-hint");
 
+    // 原图加载失败（文件被外部删了 / 网络读不到）→ 现场提示具体路径。
+    // 判定完全基于「这次能不能读到文件」，不依赖数据库里的丢失标记：
+    // 标记可能过时（文件已放回 → 这里照样能打开），也绝不因为一次失败就改库。
+    img.onerror = () => {
+      const it = this.list[this.index];
+      img.classList.add("hidden");
+      hint.textContent = it
+        ? "图片路径已丢失：" + it.path +
+          "（记录与标签仍保留；把文件放回原处即可恢复，要清理请右键目录「⟳ 重新扫描」）"
+        : "图片加载失败";
+      hint.classList.remove("hidden");
+    };
+    img.onload = () => hint.classList.add("hidden");
+
     // 标题与计数
     document.getElementById("viewer-title").textContent =
       "[" + (this.index + 1) + "/" + this.list.length + "] " + item.filename;
@@ -56,17 +70,8 @@ const Viewer = {
     // 标签
     this.renderTags(item);
 
-    // 文件外部丢失：不加载，直接提示路径（记录/标签仍在，盘接回即可恢复）
-    if (item.status === "missing") {
-      video.pause();
-      video.classList.add("hidden");
-      document.getElementById("video-controls").classList.add("hidden");
-      img.classList.add("hidden");
-      img.removeAttribute("src");
-      hint.textContent = "图片路径已丢失：" + item.path;
-      hint.classList.remove("hidden");
-      return;
-    }
+    // 注意：**已标记为丢失的项也照常尝试加载**——文件可能已经放回来了。
+    // 真读不到时由上面 img.onerror（图片）或视频错误提示给出具体路径。
     hint.classList.add("hidden");
 
     if (item.type === "video") {

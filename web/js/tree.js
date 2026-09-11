@@ -83,7 +83,7 @@ const TreeView = {
       '<span class="count">' +
       (!offline && node.missing_count ? '<span class="miss">' + node.missing_count + "⚠</span> " : "") +
       (node.media_count || "") + "</span>";
-    // 点击目录：校验磁盘存在性（离线/丢失都只提示、绝不删记录），再切换筛选
+    // 点击目录：只读探测磁盘存在性（**绝不改库、绝不标记录**），再切换筛选
     div.onclick = async (e) => {
       e.stopPropagation();
       try {
@@ -91,8 +91,11 @@ const TreeView = {
         if (res.root_offline) {
           toast("所在盘/根目录当前不可达（未挂载）：" + node.path, "err");
           this.markNode(div, node, "offline");
+        } else if (res.unknown) {
+          // 读不到（网络/权限）≠ 不存在：不做任何判断，也不改样式
+          this.markNode(div, node, "");
         } else if (!res.exists) {
-          toast("目录路径已丢失：" + node.path, "err");
+          toast("目录路径已丢失：" + node.path + "（记录仍保留；如需清理请右键「重新扫描」后按弹窗确认）", "err");
           this.markNode(div, node, "missing");
         }
         // 注意：这里不整树 refresh —— 目录树是纯数据库读取、不逐目录 stat，
@@ -227,14 +230,16 @@ const TreeView = {
     }
   },
 
-  /** 检查某目录是否还在磁盘（丢失只标记，不删记录） */
+  /** 只读检查某目录是否还在磁盘（不改库、不标记；要标记/清理请用「重新扫描」） */
   async verify(node) {
     try {
       const res = await API.post("/api/library/check", { folder_id: node.id });
-      if (res.exists) {
+      if (res.unknown) {
+        toast("无法确认（网络/权限读不到）：" + node.path, "err");
+      } else if (res.exists) {
         toast("目录存在", "ok");
       } else {
-        toast("目录路径已丢失：" + node.path + "（记录已保留，未删除）", "err");
+        toast("目录路径已丢失：" + node.path + "（记录已保留，未删除；清理请用「重新扫描」）", "err");
       }
       await this.refresh();
     } catch (e) {

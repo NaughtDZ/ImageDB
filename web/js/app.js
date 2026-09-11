@@ -65,7 +65,7 @@ const App = {
     // 顶栏按钮
     document.getElementById("btn-import").onclick = () => this.importFolder();
     document.getElementById("btn-rescan").onclick = () => this.rescanCurrent();
-    document.getElementById("btn-verify").onclick = () => this.verifyAll();
+    document.getElementById("btn-recheck-missing").onclick = () => this.recheckMissing();
     document.getElementById("btn-settings").onclick = () => Settings.open();
     document.getElementById("btn-add-folder").onclick = () => this.importFolder();
 
@@ -217,8 +217,10 @@ const App = {
       keepBtn.textContent = "知道了";
     } else {
       const extra = res.dir_missing ? "（该目录本身已丢失）" : "";
+      const unknown = res.dirs_unknown || 0;
       summary.textContent =
-        "新增 " + added + " 个 · 发现丢失 " + missing + " 个 · 恢复 " + recovered + " 个" + extra;
+        "新增 " + added + " 个 · 发现丢失 " + missing + " 个 · 恢复 " + recovered + " 个" + extra +
+        (unknown ? "\n有 " + unknown + " 个目录读不到（网络/权限），已跳过、未做任何标记。" : "");
       purgeBtn.style.display = "";
       keepBtn.textContent = "保留丢失记录";
     }
@@ -254,18 +256,26 @@ const App = {
     }
   },
 
-  /** 全库扫描丢失（只标记，不删记录） */
-  async verifyAll() {
+  /**
+   * 恢复校验：把「被标记为丢失、但实际还在磁盘上」的记录恢复回正常。
+   * 只恢复、不标记、不删除；读不到的（网络/权限）保持原状，绝不误判。
+   */
+  async recheckMissing() {
+    if (!confirm("恢复校验：检查所有被标记为「丢失」的记录，\n" +
+                 "把实际还在磁盘上的恢复回正常（只恢复，不删除任何记录）。\n\n继续？")) return;
     try {
-      const res = await API.post("/api/library/verify", {});
-      const off = (res.offline_roots || []).length;
-      toast("扫描完成：新标记丢失 " + (res.missing || 0) + " 个 · 恢复 " + (res.recovered || 0) +
-            " 个 · 缺失目录 " + (res.dirs_missing || 0) + " 个" +
-            (off ? " · 离线根目录 " + off + " 个（已跳过未标记）" : "") + "（未删除记录）", "ok");
+      toast("正在校验…", "ok");
+      const res = await API.post("/api/library/recheck_missing", { folder_id: 0 });
+      const parts = ["检查 " + (res.checked || 0) + " 条",
+                     "恢复 " + (res.recovered || 0) + " 条"];
+      if (res.still_missing) parts.push("仍缺失 " + res.still_missing + " 条");
+      if (res.unknown) parts.push("无法确认 " + res.unknown + " 条（网络/权限，保持原状）");
+      toast("恢复校验完成：" + parts.join(" · "), "ok");
       await TreeView.refresh();
       await Gallery.load(true);
+      SidePanel.refresh();
     } catch (e) {
-      toast("扫描失败：" + e.message, "err");
+      toast("恢复校验失败：" + e.message, "err");
     }
   },
 

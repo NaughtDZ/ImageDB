@@ -185,8 +185,13 @@ const Gallery = {
       this.cacheThumb(id, worker);
     };
     worker.onerror = () => {
+      // 缩略图请求本身失败（后端报错/网络断）→ 就地显示内置占位图，不留破图图标
       this._loading.delete(id);
-      im.style.background = "var(--bg-hover)";
+      const box = im.parentElement;
+      if (box && !box.querySelector("svg")) {
+        box.classList.add("missing-thumb");
+        box.innerHTML = MISSING_SVG;
+      }
       im.alt = "⚠";
     };
     worker.src = url;
@@ -198,7 +203,7 @@ const Gallery = {
     box.innerHTML = "";
     if (!App.state.items.length) {
       box.innerHTML = App.state.filters.status === "missing"
-      ? '<div class="empty">当前范围没有「丢失」的媒体。<br>（提示：丢失是扫描出来的——可点顶栏「🔎 扫描丢失」或右键目录「重新扫描」）</div>'
+      ? '<div class="empty">当前范围没有「丢失」的媒体。<br>（提示：丢失标记只在手动重扫目录时产生——右键目录「重新扫描」；顶栏「♻ 恢复校验」可把误标的恢复）</div>'
       : '<div class="empty">没有找到素材 —— 试试导入目录或调整筛选条件</div>';
       return;
     }
@@ -222,21 +227,19 @@ const Gallery = {
                      (missing ? " missing" : "");
     card.dataset.id = item.id;
 
-    // 缩略图容器：正常 → 占位背景 + 图片淡入；丢失 → 内置占位图（不发请求）
+    // 缩略图容器：**丢失项也照常请求缩略图**——后端磁盘上还有缓存缩略图就给缓存图
+    // （右上角「丢失」角标提示），没有缓存才返回占位图。
+    // 这样外部删掉的图你依然能看到它长什么样，而不是只剩一个红叉。
     const thumbBox = document.createElement("div");
     thumbBox.className = "thumb-box";
-    if (missing) {
-      thumbBox.classList.add("missing-thumb");
-      thumbBox.innerHTML = MISSING_SVG;
-    } else {
-      thumbBox.style.background = "var(--bg-hover)";   // 占位
-      const img = document.createElement("img");
-      img.alt = item.filename;
-      img.className = "thumb-img";
-      img.style.opacity = "0";   // 初始透明，加载后淡入
-      img.dataset.loaded = "0";
-      thumbBox.appendChild(img);
-    }
+    if (missing) thumbBox.classList.add("missing-thumb");
+    thumbBox.style.background = "var(--bg-hover)";   // 先占位，加载后淡入
+    const img = document.createElement("img");
+    img.alt = item.filename;
+    img.className = "thumb-img";
+    img.style.opacity = "0";   // 初始透明，加载后淡入
+    img.dataset.loaded = "0";
+    thumbBox.appendChild(img);
     card.appendChild(thumbBox);
 
     // 类型徽标（立即显示）
