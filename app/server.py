@@ -52,6 +52,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import library, media as media_service, metadata as media_metadata, imagetag as imagetag_service
+from . import tagstats
 from . import version as app_version
 from .config import AppConfig
 from .database import (DATA_DIR, FRAMES_DIR, THUMBS_DIR, RECYCLE_DIR, execute, execute_rowcount,
@@ -468,6 +469,8 @@ def create_app(config: AppConfig) -> FastAPI:
                     app_version.short_label(), _vi.get("code_mtime"), _vi.get("started_at"))
         # 启动：初始化打标插件管理器
         tagging_manager.init_manager(lambda: config)
+        # 预热标签计数缓存（后台线程，不阻塞启动）：让第一次打开标签面板就是毫秒级
+        tagstats.warm()
         # 不再启动任何后台/定时的全库校验线程。
         # 原则：程序只做「恢复」，绝不定时批量标记丢失；「丢失」只能由用户在
         # 侧边栏显式重扫某个目录后确认（POST /api/library/rescan）。
@@ -547,7 +550,10 @@ def create_app(config: AppConfig) -> FastAPI:
     @app.post("/api/library/purge_missing")
     def api_purge_missing(req: FolderIdRequest) -> dict:
         """删除某目录子树下所有 status='missing' 的媒体记录（**用户显式确认后调用**）。"""
-        return library.purge_missing(req.folder_id)
+        res = library.purge_missing(req.folder_id)
+        if res.get("removed"):
+            tagstats.mark_dirty()   # 记录被删 → 标签计数需要重算
+        return res
 
     # ================= 媒体 =================
     @app.get("/api/media")
@@ -616,6 +622,8 @@ def create_app(config: AppConfig) -> FastAPI:
             ph = ",".join("?" * len(chunk))
             removed += execute_rowcount(
                 f"DELETE FROM media_items WHERE id IN ({ph})", chunk)
+        if removed:
+            tagstats.mark_dirty()   # media_tags 已随外键级联删除，标签计数需要重算
         return {"removed": removed}
 
     @app.post("/api/media/trash")
@@ -926,6 +934,8 @@ def create_app(config: AppConfig) -> FastAPI:
                 "INSERT OR IGNORE INTO media_tags(media_id, tag_id, confidence, source) VALUES (?, ?, 1.0, 'manual')",
                 (mid, tag_id),
             )
+        if added:
+            tagstats.mark_dirty()
         return {"added": added}
 
     @app.post("/api/media/{mid}/tags/remove")
@@ -940,16 +950,24 @@ def create_app(config: AppConfig) -> FastAPI:
                     "DELETE FROM media_tags WHERE media_id = ? AND tag_id = ?",
                     (mid, tag_row["id"]),
                 )
+        if removed:
+            tagstats.mark_dirty()
         return {"removed": removed}
 
     @app.get("/api/tags")
     def api_tags(q: str = "", limit: int = 200) -> dict:
-        """标签自动补全列表（含使用次数）。"""
+        """标签自动补全列表（含使用次数）。
+
+        **性能**：使用次数取自 tag_counts 缓存表（后台按 TTL 重算）。
+        以前是实时 GROUP BY 715 万行 media_tags，实测 **33 秒**；现在毫秒级。
+        计数仅用于显示与排序（允许短暂滞后），不影响任何删除/丢失判定。
+        """
+        tagstats.ensure_fresh()
         like = f"%{q}%" if q else "%"
         rows = query_all(
-            """SELECT t.name, COUNT(mt.media_id) AS c FROM tags t
-               LEFT JOIN media_tags mt ON mt.tag_id = t.id
-               WHERE t.name LIKE ? GROUP BY t.id ORDER BY c DESC, t.name LIMIT ?""",
+            """SELECT t.name, COALESCE(tc.media_count, 0) AS c
+               FROM tags t LEFT JOIN tag_counts tc ON tc.tag_id = t.id
+               WHERE t.name LIKE ? ORDER BY c DESC, t.name LIMIT ?""",
             (like, limit),
         )
         return {"tags": [{"name": r["name"], "count": r["c"]} for r in rows]}
@@ -1019,6 +1037,8 @@ def create_app(config: AppConfig) -> FastAPI:
                             "DELETE FROM media_tags WHERE tag_id = ? AND media_id IN (%s)" % ph,
                             [tag_row["id"]] + chunk,
                         )
+        if count:
+            tagstats.mark_dirty()
         return {"ok": True, "count": count, "media": len(media_ids)}
 
 
@@ -1061,6 +1081,8 @@ def create_app(config: AppConfig) -> FastAPI:
                             f"DELETE FROM media_tags WHERE tag_id = ? AND media_id IN ({del_ph})",
                             [tag_row["id"]] + chunk,
                         )
+        if count:
+            tagstats.mark_dirty()
         return {"ok": True, "count": count}
 
     @app.post("/api/tags/rename")
@@ -1087,6 +1109,7 @@ def create_app(config: AppConfig) -> FastAPI:
             execute("DELETE FROM tags WHERE id = ?", (old_row["id"],))
         else:
             execute("UPDATE tags SET name = ? WHERE id = ?", (new, old_row["id"]))
+        tagstats.mark_dirty()
         return {"ok": True}
 
     @app.post("/api/tags/delete")
@@ -1096,6 +1119,8 @@ def create_app(config: AppConfig) -> FastAPI:
         if not name:
             raise HTTPException(400, "标签名不能为空")
         removed = execute_rowcount("DELETE FROM tags WHERE name = ?", (name,))
+        if removed:
+            tagstats.mark_dirty()
         return {"ok": True, "removed": removed}
 
     # ================= 标签侧车（.imgtag）导出/导入 =================

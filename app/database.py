@@ -109,6 +109,15 @@ CREATE TABLE IF NOT EXISTS media_tags (
 );
 CREATE INDEX IF NOT EXISTS idx_media_tags_tag ON media_tags(tag_id);
 
+-- 标签计数缓存（性能优化）：预计算「每个标签有多少媒体」，供 /api/tags（标签面板/自动补全）使用。
+-- 实时聚合要扫 715 万行 media_tags（实测 30 秒以上），预计算本身只要约 0.3 秒（覆盖索引），
+-- 之后查询变成毫秒级。计数**仅用于显示与排序**，允许短暂滞后，不参与任何删除/判定逻辑。
+CREATE TABLE IF NOT EXISTS tag_counts (
+    tag_id      INTEGER PRIMARY KEY,
+    media_count INTEGER NOT NULL DEFAULT 0,
+    updated_at  TEXT
+);
+
 -- 打标任务表：记录每个打标任务的进度
 CREATE TABLE IF NOT EXISTS tag_jobs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -182,28 +191,86 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
 
 
 def init_schema() -> None:
-    """建表 + 补列（幂等，可重复调用）。"""
+    """建表 + 补列 + 设置持久化 PRAGMA（幂等，可重复调用）。"""
     ensure_dirs()
     with _write_lock:
         conn = _connect()
         try:
+            # journal_mode 写在数据库文件头里，是持久化设置 —— 只在这里设一次即可
+            try:
+                mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                logger.info("SQLite journal_mode=%s（持久化）", mode)
+            except sqlite3.Error as exc:
+                logger.warning("设置 WAL 失败（沿用原模式）：%s", exc)
             conn.executescript(SCHEMA)
             _ensure_columns(conn)
             conn.commit()
+            try:
+                eff = conn.execute("PRAGMA mmap_size").fetchone()[0]
+                if eff <= 0:
+                    logger.info("mmap 未生效（data/ 若在网络盘属正常），不影响功能")
+            except sqlite3.Error:
+                pass
         finally:
             conn.close()
 
 
+# 每个连接都要设的性能参数（大库实测：37 万媒体 / 715 万标签关联 / 696MB）。
+#   cache_size  ：页缓存 64MB（默认仅 2MB！700MB 的库会不停回读磁盘）
+#   mmap_size   ：256MB 内存映射，减少 read() 系统调用
+#   temp_store  ：临时表放内存（默认落盘，ORDER BY / GROUP BY 会写临时文件）
+#   synchronous ：NORMAL —— WAL 下掉电最多丢最后一笔事务，**不会损坏数据库文件**
+#   实测收益（每查询新连接）：列表首页 27.6→6.6ms、深翻页 57.7→18.6ms、模糊搜索 152→123ms
+_PRAGMAS: tuple[str, ...] = (
+    "PRAGMA foreign_keys=ON",
+    "PRAGMA synchronous=NORMAL",
+    "PRAGMA temp_store=MEMORY",
+    "PRAGMA cache_size=-65536",
+    "PRAGMA mmap_size=268435456",
+)
+
+# mmap_size 不适合网络盘（data/ 放网络盘时 SQLite 会自动退回普通 IO，返回 0 表示没生效）
+MMAP_SIZE = 268435456
+
+
 def _connect() -> sqlite3.Connection:
-    """打开一个新连接（每操作一个连接，避免多线程互踩）。"""
+    """打开一个新连接（每操作一个连接，避免多线程互踩）。
+
+    注意：journal_mode=WAL 是**持久化**设置（写在数据库文件头里），只在 init_schema()
+    设一次，不要每次连接都执行——实测每次多花约 1.9ms（0.34ms → 2.22ms）。
+    """
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")   # WAL 提升并发读写性能
-    except sqlite3.Error:
-        pass
-    conn.execute("PRAGMA foreign_keys=ON")
+    for pragma in _PRAGMAS:
+        try:
+            conn.execute(pragma)
+        except sqlite3.Error:
+            pass   # 老版本 SQLite 或只读环境：忽略，退化为默认值
     return conn
+
+
+def transaction(fn):
+    """在一个写事务里执行 fn(conn)：成功提交、异常回滚。
+
+    用于「删+插」这类必须原子完成的批量写（例如重建标签计数缓存），
+    避免中途失败或读者看到半成品。使用独立的显式事务，绕开 sqlite3 的隐式事务。
+    """
+    with _write_lock:
+        conn = _connect()
+        try:
+            conn.isolation_level = None      # 关闭隐式事务，改用显式 BEGIN/COMMIT
+            conn.execute("BEGIN IMMEDIATE")
+            result = fn(conn)
+            conn.execute("COMMIT")
+            return result
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
 
 
 def execute(sql: str, params: tuple | list = ()) -> int:

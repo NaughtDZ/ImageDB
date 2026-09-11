@@ -21,6 +21,7 @@ import os
 import threading
 
 from .. import media as media_service
+from .. import tagstats
 from ..database import execute, query_all, query_one
 from .base import TaggerPlugin
 
@@ -387,6 +388,9 @@ class PluginManager:
                finished_at = datetime('now','localtime') WHERE id = ?""",
             (status, message or "", job_id),
         )
+        if status == "done":
+            # 打标会新增大量 media_tags → 标签使用次数缓存立即重算（后台，不阻塞）
+            tagstats.mark_dirty()
 
     def get_job(self, job_id: int) -> dict | None:
         return query_one("SELECT * FROM tag_jobs WHERE id = ?", (job_id,))

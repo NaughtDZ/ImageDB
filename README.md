@@ -236,9 +236,28 @@ ImageDB/
 ## 🗄 数据库与缓存说明
 
 - 所有操作记录在 `data/imagedb.sqlite`（WAL 模式）：
-  `folders` / `media_items` / `tags` / `media_tags` / `tag_jobs` / `settings`；
+  `folders` / `media_items` / `tags` / `media_tags` / `tag_counts` / `tag_jobs` / `settings` / `recycle_bin`；
 - **缩略图三层缓存**：硬盘文件（data/thumbs，可设上限 LRU 清理）+ 浏览器 HTTP 缓存 + 前端内存 LRU（400 张）；
 - **缩略图清理**：仅在你**显式删除**媒体/目录（或确认清理丢失记录）时同步删除对应缩略图；外部丢失**保留**缩略图（盘接回可恢复）。
+
+### ⚡ 大库性能（百万级也够用）
+在真实库（**696MB / 37 万媒体 / 715 万条 media_tags**）上实测调优，参数都在 `app/database.py`，改完重启即生效：
+
+| 参数 | 值 | 说明 |
+|---|---|---|
+| `journal_mode` | `WAL` | **持久化**设置，只在建库时设一次（以前每次连接都设，白花约 1.9ms/次） |
+| `cache_size` | 64MB | 默认仅 2MB，700MB 的库会不停回读磁盘 |
+| `mmap_size` | 256MB | 内存映射，减少系统调用（data/ 放网络盘时 SQLite 自动退回普通 IO） |
+| `temp_store` | `MEMORY` | 默认临时表落盘，`ORDER BY` / `GROUP BY` 会写临时文件 |
+| `synchronous` | `NORMAL` | WAL 下掉电最多丢最后一笔事务，**不会损坏数据库文件**；追求极致安全可改回 `FULL` |
+
+**标签使用次数做了缓存表 `tag_counts`**：`/api/tags`（打开标签面板 / 自动补全就会调它）以前每次都要对 715 万行 `media_tags` 实时聚合，实测 **33 秒**；现在读 1 万行的小表，**76 毫秒**。
+
+- 全量重算本身只要约 0.3 秒（覆盖索引聚合），在**独立写事务**里由后台线程完成，不阻塞请求；
+- 触发时机：启动预热 + 标签被增删改后立即重算 + 最长 60 秒 TTL 兜底；
+- **计数只用于显示与排序**，允许短暂滞后，绝不参与删除/丢失判定；`tag_counts` 表随时可 `DROP`，不影响任何数据。
+
+实测对比（列表首页 / 深翻页 / 标签面板）：**27.6ms → 6.6ms**、**57.7ms → 18.6ms**、**33.3s → 76ms**。
 
 > 若数据库在网络驱动器上 WAL 较慢，可在 `app/database.py` 把 `journal_mode=WAL` 改为 `DELETE`。
 
