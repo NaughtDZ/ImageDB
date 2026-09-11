@@ -11,6 +11,11 @@
 const TreeView = {
   /** 刷新目录树（重新请求后端） */
   async refresh() {
+    // 先把「正在加载」显示出来，避免网络盘/大库时界面像卡死（数据到了再整体替换）
+    const box = document.getElementById("tree");
+    if (box && box.children.length === 0) {
+      box.innerHTML = '<div class="hint" style="padding:10px">正在加载目录…</div>';
+    }
     try {
       const data = await API.get("/api/tree");
       App.state.tree = data.tree || [];

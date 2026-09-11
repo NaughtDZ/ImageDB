@@ -16,14 +16,50 @@
 """
 from __future__ import annotations
 
+import concurrent.futures as _cf
 import logging
 import os
+import time
 
 from .database import (chunk_ids, delete, execute, execute_rowcount, executemany,
                       query_all, query_one)
 from .imagetag import is_sidecar
 
 logger = logging.getLogger("imagedb.library")
+
+# ---- 根目录可达性检查：TTL 缓存 + 超时保护 ----
+# 网络盘/移动盘未挂载或掉线时，os.path.isdir 可能阻塞数秒甚至更久。
+# 因此把探测放到线程里跑并设超时（超时视为不可达 = 离线，绝不阻塞请求），
+# 再用 TTL 缓存避免每次 /api/tree 都去碰磁盘。
+_ROOT_TTL = 20.0        # 缓存有效期（秒）
+_ROOT_TIMEOUT = 1.5     # 单次探测超时（秒）
+_root_cache: dict[str, tuple[float, bool]] = {}
+_probe_pool = _cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="fsprobe")
+
+
+def _isdir_fast(path: str, ttl: float = _ROOT_TTL, timeout: float = _ROOT_TIMEOUT) -> bool:
+    """带 TTL 缓存 + 超时保护的目录存在性检查（用于根目录这种少量探测）。
+
+    超时或异常一律返回 False（按不可达处理）——宁可显示「离线」，也不阻塞界面。
+    """
+    if not path:
+        return False
+    now = time.monotonic()
+    hit = _root_cache.get(path)
+    if hit is not None and now - hit[0] < ttl:
+        return hit[1]
+    try:
+        val = bool(_probe_pool.submit(os.path.isdir, path).result(timeout=timeout))
+    except Exception:  # noqa: BLE001 - 超时/异常 → 视为不可达
+        logger.debug("根目录探测超时/异常，按不可达处理：%s", path)
+        val = False
+    _root_cache[path] = (now, val)
+    return val
+
+
+def invalidate_root_cache() -> None:
+    """清空根目录可达性缓存（扫描/重扫后可调用，让状态立即刷新）。"""
+    _root_cache.clear()
 
 # 支持的图片扩展名
 IMAGE_EXTS = {
@@ -413,7 +449,7 @@ def root_offline(root_id: int) -> bool:
     这样把「盘没挂」与「文件真被删」区分开，避免拔盘就把整库标成 missing。
     """
     row = query_one("SELECT path FROM folders WHERE id = ?", (root_id,))
-    return bool(row) and not os.path.isdir(row["path"])
+    return bool(row) and not _isdir_fast(row["path"])
 
 
 def _count_media_in(folder_ids: list[int]) -> int:
@@ -474,6 +510,7 @@ def rescan_folder(folder_id: int) -> dict:
     folder = query_one("SELECT * FROM folders WHERE id = ?", (folder_id,))
     if not folder:
         raise ValueError(f"目录 id 不存在：{folder_id}")
+    invalidate_root_cache()   # 用户主动扫描：重新探测根目录可达性
     # 根目录不可达（盘没挂/被拔）→ 视为「离线」，不做任何标记
     rid = _root_of(folder_id)
     if rid is not None and root_offline(rid):
@@ -542,10 +579,11 @@ def verify_all() -> dict:
     避免「拔盘 → 几十万条被误标丢失」。
     返回 {missing, recovered, dirs_missing, offline_roots}。
     """
+    invalidate_root_cache()   # 手动/定时扫描：重新探测根目录
     rmap, paths = _folder_root_map()
     reach: dict[int, bool] = {}
     for rid in {v for v in rmap.values() if v is not None}:
-        reach[rid] = os.path.isdir(paths.get(rid, ""))
+        reach[rid] = _isdir_fast(paths.get(rid, ""))
     offline_roots = [paths[r] for r, ok in reach.items() if not ok]
 
     missing = 0
@@ -674,7 +712,7 @@ def build_tree() -> dict:
             _walk(ch, offline)
 
     for r in roots:
-        _walk(r, offline=not os.path.isdir(r["path"]))
+        _walk(r, offline=not _isdir_fast(r["path"]))
 
     _ms = (_time.perf_counter() - _t0) * 1000
     if _ms > 500:
