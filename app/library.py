@@ -659,7 +659,11 @@ def remove_media_item(media_id: int) -> bool:
 
 def build_tree() -> dict:
     """
-    从数据库构建目录树（纯数据库读取，不访问磁盘）。
+    从数据库构建目录树。
+
+    **性能不变量（务必遵守）**：除「根目录可达性」外**不得访问磁盘**。
+    根目录通常只有 1~4 个（走 _isdir_fast，带超时+缓存）；
+    一旦在这里对每个目录 isdir/scandir，网络盘上 5000+ 目录会变成十几秒的卡顿。
     返回：
         {
           "tree": [ {id, name, path, is_root, parent_id, children: [...], media_count} ],
@@ -685,8 +689,10 @@ def build_tree() -> dict:
             "parent_id": f["parent_id"],
             "children": [],
             "media_count": count_map.get(f["id"], 0),
-            # 目录本身是否还在磁盘上（动态检测，不写库）；缺失目录仍显示，仅标注
-            "missing": not os.path.isdir(f["path"]),
+            # 目录本身是否还在磁盘上：**这里绝不做磁盘检查**（否则 5000+ 目录每个一次 isdir，
+            # 网络盘上就是十几秒）。统一在下面 _walk 里按根目录可达性推断；
+            # 单目录被删的情形等用户点击该节点时按需判定（check_folder）。
+            "missing": False,
             # 该目录下被标记为丢失的媒体数
             "missing_count": miss_map.get(f["id"], 0),
             # 所在根目录是否不可达（盘没挂/被拔）→ 由下面 walk 覆盖
