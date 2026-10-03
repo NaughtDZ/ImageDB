@@ -57,6 +57,22 @@ def progress_cb(jid: str):
     return cb
 
 
+def percent_cb(jid: str, cap: int = 99):
+    """生成「绝对百分比」进度回调：cb(pct, message)。
+
+    用于**多阶段**任务（例如目录扫描 = 遍历磁盘 + 逐目录同步）：各阶段自己把
+    进度折算成总百分比，避免每段都从 0 跑到 100 再跳回去。
+    计数信息直接写进 message（前端会原样显示）。
+    """
+    def cb(pct, message: str = "") -> None:
+        with _LOCK:
+            job = JOBS.get(jid)
+            if job:
+                job.update(progress=max(0, min(cap, int(pct))),
+                           message=message or job.get("message"))
+    return cb
+
+
 def finish(jid: str, status: str, result=None, error: str | None = None) -> None:
     """结束任务：status 取 done / failed。"""
     with _LOCK:

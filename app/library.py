@@ -103,19 +103,56 @@ def _insert_folder(name: str, path: str, parent_id: int | None, is_root: int = 0
     )
 
 
-def _walk_and_insert(dir_path: str, parent_db_id: int, seen: set[str]) -> tuple[int, int]:
+def _walk_and_insert(dir_path: str, parent_db_id: int, seen: set[str],
+                      progress_cb=None, known: dict[str, int] | None = None,
+                      known_files: set[str] | None = None, dir_cb=None,
+                      _stats: dict | None = None, depth: int = 0) -> tuple[int, int]:
     """
     递归扫描目录并写入数据库。
     返回 (新增目录数, 新增媒体数)。
     seen 用于避免符号链接造成的死循环。
+
+    progress_cb(已访问目录数, 当前路径)：每进一个目录回调一次，供前端显示进度
+    （这是重扫里最慢的一段，没有它进度条会长时间停在 0%）。
+
+    known：{磁盘路径: 目录 id}，调用方预先查好的「库里已有目录」。
+    命中就直接复用，省掉每个目录一次查库（网络盘实测 0.58ms/个，1 万目录约 6 秒）；
+    未命中才真正写库，并顺手记进 known 以免重复查。
+
+    known_files：调用方预先查好的「库里已有媒体路径」。命中就**直接跳过**
+    （既不插入、也不取 stat）——重扫时磁盘上绝大多数文件都已入库，
+    不跳过的话会对每个文件做一次 INSERT OR IGNORE 且每个目录一次独立事务，
+    实测 1 万目录/9 万文件时会多花好几分钟。
+
+    dir_cb(folder_db_id, 磁盘目录项集合)：每进一个目录回调一次，把**已经拿到**的
+    目录项交给调用方，避免它为了判定 ok/missing 再 scandir 一遍
+    （网络盘 1.4ms/目录，1 万目录 ≈ 15 秒）。
     """
     folders_added = 0
     media_added = 0
+    if _stats is None:
+        _stats = {"dirs": 0}
+    if depth > 128:
+        logger.warning("目录层级过深（>128），停止下探：%s", dir_path)
+        return 0, 0
+    _stats["dirs"] += 1
+    if progress_cb:
+        try:
+            progress_cb(_stats["dirs"], dir_path)
+        except Exception:  # noqa: BLE001  进度回调绝不能影响扫描本身
+            pass
     try:
         entries = list(os.scandir(dir_path))
     except OSError as exc:
         logger.warning("无法读取目录 %s：%s", dir_path, exc)
         return 0, 0
+
+    # 把刚拿到的目录项交给调用方（重扫用它就地判定 ok/missing，省掉第二次扫描）
+    if dir_cb is not None:
+        try:
+            dir_cb(parent_db_id, {e.name for e in entries})
+        except Exception:  # noqa: BLE001
+            pass
 
     media_rows: list[tuple] = []
     subdirs: list[os.DirEntry] = []
@@ -128,6 +165,8 @@ def _walk_and_insert(dir_path: str, parent_db_id: int, seen: set[str]) -> tuple[
             elif entry.is_file(follow_symlinks=False):
                 mtype = media_type_of(entry.path)
                 if mtype:
+                    if known_files is not None and entry.path in known_files:
+                        continue          # 已入库：不必再插，也不必取 stat
                     st = entry.stat(follow_symlinks=False)
                     media_rows.append((
                         parent_db_id, entry.path, entry.name, mtype,
@@ -148,13 +187,26 @@ def _walk_and_insert(dir_path: str, parent_db_id: int, seen: set[str]) -> tuple[
 
     # 递归子目录
     for entry in subdirs:
-        real = os.path.realpath(entry.path)
-        if real in seen:
+        # realpath 在网络上每次要 2.7ms（实测，1 万目录 ≈ 29 秒），只有链接/联接点
+        # 才需要它来防环；普通目录用纯字符串归一化即可（0.001ms）。
+        try:
+            risky = entry.is_symlink() or entry.is_junction()
+        except (OSError, AttributeError):
+            risky = True
+        keys = [os.path.normcase(entry.path)]
+        if risky:
+            keys.append(os.path.realpath(entry.path))
+        if any(k in seen for k in keys):
             continue
-        seen.add(real)
-        sub_id = _insert_folder(entry.name, entry.path, parent_db_id)
-        folders_added += 1
-        a, b = _walk_and_insert(entry.path, sub_id, seen)
+        seen.update(keys)
+        sub_id = known.get(entry.path) if known is not None else None
+        if sub_id is None:
+            sub_id = _insert_folder(entry.name, entry.path, parent_db_id)
+            folders_added += 1
+            if known is not None:
+                known[entry.path] = sub_id
+        a, b = _walk_and_insert(entry.path, sub_id, seen, progress_cb, known,
+                                known_files, dir_cb, _stats, depth + 1)
         folders_added += a
         media_added += b
     return folders_added, media_added
@@ -434,6 +486,11 @@ def root_offline(root_id: int) -> bool:
     return bool(row) and not _isdir_fast(row["path"])
 
 
+# 重扫时预载「已入库媒体路径」的规模上限（超过则不预载，退回逐个 INSERT OR IGNORE）
+# 8 万条路径约占 10MB 内存，30 万条约 40MB —— 够用且不会失控。
+_KNOWN_FILES_LIMIT = 300_000
+
+
 def _count_media_in(folder_ids: list[int]) -> int:
     """统计若干目录下的媒体数量。"""
     if not folder_ids:
@@ -491,18 +548,14 @@ def _mark_all_missing(folder_ids: list[int], reason: str = "mark") -> int:
     return n
 
 
-def _sync_dir_status(folder_db_id: int, dir_path: str, reason: str = "rescan:not_found"
-                     ) -> tuple[int, int, int]:
-    """按磁盘实际目录项，把该目录下媒体在 ok/missing 间同步（**不删除记录**）。
+def _sync_with_names(folder_db_id: int, on_disk: set[str],
+                     reason: str = "rescan:not_found") -> tuple[int, int]:
+    """按**已经取得**的磁盘目录项，把该目录下媒体在 ok/missing 间同步（不删记录）。
 
-    返回 (新标记为 missing 数, 恢复为 ok 数, 是否未知)。
-    目录读不到（scandir 抛 OSError）→ 返回 (0, 0, 1)，**一条都不标记**。
-    用 scandir 目录项比对而不是 os.path.isfile：天然区分「读不到目录」与「文件不在」。
+    返回 (新标记为 missing 数, 恢复为 ok 数)。
+    与 _sync_dir_status 的区别：调用方已经 scandir 过了，这里不再重复扫描磁盘
+    （网络盘上实测量目录 1.4ms/次，1 万目录就是 15 秒）。
     """
-    try:
-        on_disk = {e.name for e in os.scandir(dir_path)}
-    except OSError:
-        return 0, 0, 1
     miss = 0
     ok = 0
     for item in query_all("SELECT id, filename, status FROM media_items WHERE folder_id = ?",
@@ -518,7 +571,30 @@ def _sync_dir_status(folder_db_id: int, dir_path: str, reason: str = "rescan:not
                 miss += 1
             else:
                 ok += 1
-    return miss, ok, 0
+    return miss, ok
+
+
+def _sync_dir_status(folder_db_id: int, dir_path: str, reason: str = "rescan:not_found"
+                     ) -> tuple[int, int, str]:
+    """按磁盘实际目录项，把该目录下媒体在 ok/missing 间同步（**不删除记录**）。
+
+    返回 (新标记为 missing 数, 恢复为 ok 数, 目录状态)，目录状态取：
+      'ok'      目录可读（已按目录项比对完成同步）
+      'absent'  目录确认不存在（FileNotFoundError）→ 调用方负责整目录标记 missing
+      'unknown' 读不到（权限/网络/掉线）→ **一条都不标记**
+
+    用 scandir 目录项比对而不是 os.path.isfile：天然区分「读不到目录」与「文件不在」，
+    而且一次 scandir 同时给出「目录在不在」和「文件在不在」，
+    调用方无需再多做一次 os.stat（网络盘上实测省 2.6ms/目录）。
+    """
+    try:
+        on_disk = {e.name for e in os.scandir(dir_path)}
+    except FileNotFoundError:
+        return 0, 0, "absent"
+    except OSError:
+        return 0, 0, "unknown"
+    miss, ok = _sync_with_names(folder_db_id, on_disk, reason)
+    return miss, ok, "ok"
 
 
 def rescan_folder(folder_id: int, progress_cb=None) -> dict:
@@ -557,39 +633,82 @@ def rescan_folder(folder_id: int, progress_cb=None) -> dict:
                 "dir_missing": True, "root_offline": False}
 
     dirs = _subtree_folder_ids(folder_id)
-    total = len(dirs) + 1          # +1 = 补录新增文件那一步
+    total = max(len(dirs), 1)
 
-    def report(done: int, msg: str) -> None:
+    # 预载「磁盘路径 → 目录 id」：遍历阶段命中就直接复用，省掉每个目录一次查库
+    # （网络盘实测单查 0.58ms/个，1 万目录约 6 秒；批量预载 1 万条约 41 毫秒）
+    known: dict[str, int] = {}
+    for chunk in chunk_ids(dirs):
+        ph = ",".join("?" * len(chunk))
+        for r in query_all(f"SELECT id, path FROM folders WHERE id IN ({ph})", chunk):
+            known[r["path"]] = r["id"]
+
+    # 预载「已入库媒体路径」：重扫时磁盘上绝大多数文件都已入库，命中就跳过，
+    # 否则每个文件都要做一次 INSERT OR IGNORE、每个目录还要一次独立事务
+    #（实测 1 万目录/9 万文件时这是最大的一笔开销，能多花好几分钟）。
+    n_media = 0
+    for chunk in chunk_ids(dirs):
+        ph = ",".join("?" * len(chunk))
+        n_media += query_one(
+            f"SELECT COUNT(*) AS c FROM media_items WHERE folder_id IN ({ph})", chunk)["c"]
+    known_files: set[str] | None = set()
+    if n_media > _KNOWN_FILES_LIMIT:
+        known_files = None     # 太大就不预载（避免内存尖峰），退回旧行为
+        logger.info("子树媒体数 %d 超过预载上限，跳过路径预载", n_media)
+    else:
+        for chunk in chunk_ids(dirs):
+            ph = ",".join("?" * len(chunk))
+            for r in query_all(f"SELECT path FROM media_items WHERE folder_id IN ({ph})", chunk):
+                known_files.add(r["path"])
+
+    def report(pct: int, msg: str) -> None:
         if progress_cb:
-            progress_cb(done, total, msg)
+            progress_cb(pct, msg)
 
-    # 1. 补录磁盘上新增的目录与媒体
-    report(0, "正在检查新增文件…")
-    seen: set[str] = {os.path.realpath(folder["path"])}
-    _fa, added = _walk_and_insert(folder["path"], folder_id, seen)
-
-    # 2. 逐目录同步 ok/missing（不删任何记录；读不到的目录跳过）
     missing = 0
     recovered = 0
     unknown = 0
-    for i, f in enumerate(dirs, 1):
-        frow = query_one("SELECT name, path FROM folders WHERE id = ?", (f,))
-        if not frow:
-            report(i, "正在扫描：%d/%d" % (i, total))
-            continue
-        report(i, "正在扫描：" + (frow["name"] or frow["path"]))
-        st = probe_dir(frow["path"])
-        if st == "unknown":
-            unknown += 1
-            continue
-        if st == "absent":
-            missing += _mark_all_missing([f], "rescan:dir_missing")
-            continue
-        m, o, u = _sync_dir_status(f, frow["path"])
+    visited: set[int] = set()
+
+    def on_dir(fid: int, names: set[str]) -> None:
+        """拿到目录项的同一时刻就地同步状态——不重复扫第二遍磁盘。"""
+        nonlocal missing, recovered
+        visited.add(fid)
+        m, o = _sync_with_names(fid, names)
         missing += m
         recovered += o
-        unknown += u
-    report(total, "扫描完成")
+
+    # ---- 阶段 1（0~96%）：遍历磁盘 → 补录新增 + 就地同步 ok/missing ----
+    # 这是全部耗时所在（万级目录在网络盘上要几十秒），**必须上报进度**，
+    # 否则进度条会长久停在 0%，用户以为卡死（旧版就是这个毛病）。
+    def walk_progress(n: int, _path: str) -> None:
+        if n % 20 == 1:                # 每 20 个目录更新一次，避免频繁抢锁
+            report(min(95, int(96 * n / total)),
+                   "正在扫描磁盘…（已处理 %d 个目录）" % n)
+
+    report(0, "正在扫描磁盘…")
+    seen: set[str] = {os.path.realpath(folder["path"])}
+    _fa, added = _walk_and_insert(folder["path"], folder_id, seen,
+                                 progress_cb=walk_progress, known=known,
+                                 known_files=known_files, dir_cb=on_dir)
+
+    # ---- 阶段 2（96~99%）：只处理磁盘上「没走到」的目录（已消失 / 读不到）----
+    # 正常情况下这里几乎是空转（所有目录都在阶段 1 处理过了）。
+    for f in dirs:
+        if f in visited:
+            continue
+        frow = query_one("SELECT path FROM folders WHERE id = ?", (f,))
+        if not frow:
+            continue
+        m, o, st = _sync_dir_status(f, frow["path"])
+        if st == "absent":
+            missing += _mark_all_missing([f], "rescan:dir_missing")
+        elif st == "unknown":
+            unknown += 1
+        else:
+            missing += m
+            recovered += o
+    report(99, "扫描完成")
 
     return {"added": added, "missing": missing, "recovered": recovered,
             "dirs_unknown": unknown, "dir_missing": False, "root_offline": False}
@@ -607,7 +726,7 @@ def start_rescan(folder_id: int) -> str:
     jid = jobs.new_job("scan", label)
     return jobs.run_async(
         jid,
-        lambda: rescan_folder(folder_id, jobs.progress_cb(jid)),
+        lambda: rescan_folder(folder_id, jobs.percent_cb(jid)),
         name="scan",
     )
 
