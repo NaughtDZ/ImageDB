@@ -17,7 +17,7 @@ const Imagetag = {
     document.querySelectorAll("[data-close='imagetag-log-modal']").forEach(el => {
       el.onclick = () => {
         document.getElementById("imagetag-log-modal").classList.add("hidden");
-        if (this._pollTimer) { clearTimeout(this._pollTimer); this._pollTimer = null; this._busy = false; }
+        JobProgress.stopPolling();   // 关窗即停轮询；后台任务本身继续跑
       };
     });
     document.getElementById("imagetag-import-cancel").onclick = () =>
@@ -26,62 +26,14 @@ const Imagetag = {
   },
 
   /* ---------------- 进度弹窗 + 后台任务轮询 ---------------- */
-  _showProgress(title, text) {
-    document.getElementById("imagetag-log-title").textContent = title;
-    document.getElementById("imagetag-progress").classList.remove("hidden");
-    document.getElementById("imagetag-progress-bar").style.width = "0%";
-    document.getElementById("imagetag-progress-text").textContent = text || "准备中…";
-    document.getElementById("imagetag-log").innerHTML = "";
-    document.getElementById("imagetag-log-modal").classList.remove("hidden");
-  },
+  // 进度弹窗与轮询统一走 JobProgress（目录重新扫描也用同一套，见 web/js/jobprogress.js）
+  _showProgress(title, text) { JobProgress.show(title, text); },
 
-  _updateProgress(job) {
-    const pct = Math.max(0, Math.min(100, job.progress || 0));
-    document.getElementById("imagetag-progress-bar").style.width = pct + "%";
-    document.getElementById("imagetag-progress-text").textContent =
-      (job.message || "") +
-      (job.total ? "  （" + (job.done || 0) + " / " + job.total + "）" : "");
-  },
+  _updateProgress(job) { JobProgress.update(job); },
 
   /** 启动 .imgtag 后台任务并轮询进度；完成后回调 onDone(result)。 */
   async _runJob(title, startFn, onDone) {
-    if (this._busy) { toast("已有任务在进行中，请稍候", "err"); return; }
-    this._busy = true;
-    this._showProgress(title, "正在启动…");
-    let jobId;
-    try {
-      const r = await startFn();
-      jobId = r && r.job_id;
-      if (!jobId) throw new Error("未返回任务 id");
-    } catch (e) {
-      this._busy = false;
-      this._openLog(title, '<div class="row err">启动失败：' + escapeHtml(e.message) + "</div>");
-      return;
-    }
-    const t0 = Date.now();
-    const tick = async () => {
-      let job;
-      try {
-        job = await API.get("/api/tags/jobs/" + jobId);
-      } catch (e) {
-        this._busy = false;
-        this._openLog(title, '<div class="row err">读取进度失败：' + escapeHtml(e.message) + "</div>");
-        return;
-      }
-      this._updateProgress(job);
-      if (job.status === "running") {
-        this._pollTimer = setTimeout(tick, Date.now() - t0 < 1500 ? 200 : 500);
-        return;
-      }
-      this._busy = false;
-      document.getElementById("imagetag-progress").classList.add("hidden");
-      if (job.status === "failed") {
-        this._openLog(title, '<div class="row err">失败：' + escapeHtml(job.error || "未知错误") + "</div>");
-        return;
-      }
-      onDone(job.result || {});
-    };
-    tick();
+    return JobProgress.run(title, startFn, onDone, "/api/tags/jobs/");
   },
 
   /* ---------------- 导出 ---------------- */

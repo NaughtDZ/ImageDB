@@ -8,7 +8,8 @@ HTTP 服务模块
 API 概览：
     GET    /api/tree                      目录树（纯数据库读取）
     POST   /api/library/import            导入目录
-    POST   /api/library/rescan            重新扫描目录
+    POST   /api/library/rescan            重新扫描目录（后台任务，返回 job_id）
+    GET    /api/library/jobs/{jid}        查询扫描任务进度
     POST   /api/library/remove            从库中移除目录
     POST   /api/library/recheck_missing   恢复校验（只把误标的丢失恢复回正常）
     POST   /api/library/check             只读检查单个目录是否存在（不改库）
@@ -52,7 +53,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import library, media as media_service, metadata as media_metadata, imagetag as imagetag_service
-from . import tagstats
+from . import jobs, tagstats
 from . import version as app_version
 from .config import AppConfig
 from .database import (DATA_DIR, FRAMES_DIR, THUMBS_DIR, RECYCLE_DIR, execute, execute_rowcount,
@@ -515,14 +516,27 @@ def create_app(config: AppConfig) -> FastAPI:
             return dict(job)
     @app.post("/api/library/rescan")
     def api_rescan(req: FolderIdRequest) -> dict:
-        """重新扫描目录（**只标记不删**）：补录新增、把消失的媒体标记为 missing。
+        """重新扫描目录（**后台任务** / 只标记不删）：补录新增、把消失的媒体标记为 missing。
 
-        返回 {added, missing, recovered, dir_missing}，由前端弹窗询问是否清理丢失记录。
+        **立即返回 {job_id}**，前端轮询 /api/library/jobs/{jid} 显示进度条。
+        完成后 job["result"] = {added, missing, recovered, dir_missing, root_offline,
+        dirs_unknown}，由前端弹窗询问是否清理丢失记录。
+        同一时间只允许一个扫描任务（重复点返回 409）。
         """
-        try:
-            return library.rescan_folder(req.folder_id)
-        except ValueError as exc:
-            raise HTTPException(400, str(exc))
+        running = jobs.busy("scan")
+        if running:
+            raise HTTPException(409, "已有扫描在进行中：" + str(running.get("label") or ""))
+        if query_one("SELECT id FROM folders WHERE id = ?", (req.folder_id,)) is None:
+            raise HTTPException(404, "目录不存在")
+        return {"job_id": library.start_rescan(req.folder_id)}
+
+    @app.get("/api/library/jobs/{jid}")
+    def api_library_job(jid: str) -> dict:
+        """查询目录扫描任务进度（含完成后的 result）。"""
+        job = jobs.get_job(jid)
+        if job is None:
+            raise HTTPException(404, "任务不存在")
+        return job
 
     @app.post("/api/library/remove")
     def api_remove(req: FolderIdRequest) -> dict:

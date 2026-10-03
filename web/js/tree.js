@@ -218,16 +218,21 @@ const TreeView = {
     }
   },
 
-  /** 重新扫描某目录（只标记丢失，弹窗询问是否清理；不自动删记录） */
+  /**
+   * 重新扫描某目录（后台任务 + 进度条；只标记丢失，扫完弹窗询问是否清理；不自动删记录）。
+   * 扫描期间弹「正在重新扫描：目录名」进度条，避免点完没反应。
+   */
   async rescan(node) {
-    try {
-      const res = await API.post("/api/library/rescan", { folder_id: node.id });
-      await this.refresh();
-      await Gallery.load(true);
-      App.showRescanResult(res, node.id);
-    } catch (e) {
-      toast("扫描失败：" + e.message, "err");
-    }
+    await JobProgress.run(
+      "重新扫描：" + node.name,
+      () => API.post("/api/library/rescan", { folder_id: node.id }),
+      async (res) => {
+        await this.refresh();
+        await Gallery.load(true);
+        App.showRescanResult(res, node.id);
+      },
+      "/api/library/jobs/",
+    );
   },
 
   /** 只读检查某目录是否还在磁盘（不改库、不标记；要标记/清理请用「重新扫描」） */

@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 
+from . import jobs
 from .database import (chunk_ids, execute, execute_rowcount, executemany,
                        query_all, query_one)
 
@@ -337,70 +338,33 @@ def self_check(folder_id: int, progress_cb=None) -> dict:
 # ---------------- 后台任务（带进度，供前端轮询） ----------------
 # 导出/导入/自检可能要对成千上万个目录读写 .imgtag（网络盘上很慢），
 # 因此统一放到后台线程执行，前端按 job_id 轮询进度，避免"点了没反应"。
-JOBS: dict[str, dict] = {}
-_JOBS_LOCK = threading.Lock()
-_MAX_JOBS = 50
+# 注册表实现见 app/jobs.py（目录扫描等其它后台任务也用同一套）
+JOBS = jobs.JOBS
 
 
 def _new_job(kind: str, label: str) -> str:
-    jid = uuid.uuid4().hex[:12]
-    with _JOBS_LOCK:
-        if len(JOBS) >= _MAX_JOBS:   # 简单裁剪：丢弃最旧的
-            for k in sorted(JOBS, key=lambda x: JOBS[x]["_ts"])[: len(JOBS) - _MAX_JOBS + 1]:
-                JOBS.pop(k, None)
-        JOBS[jid] = {
-            "id": jid, "kind": kind, "label": label, "status": "running",
-            "total": 0, "done": 0, "progress": 0,
-            "message": "准备中…", "result": None, "error": None,
-            "_ts": time.time(),
-            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-    return jid
+    return jobs.new_job(kind, label)
 
 
 def _progress_cb(jid: str):
     """生成进度回调：写入任务记录的 done/total/progress/message。"""
-    def cb(done: int, total: int, message: str = "") -> None:
-        pct = int(done / total * 100) if total else 0
-        with _JOBS_LOCK:
-            job = JOBS.get(jid)
-            if job:
-                job.update(done=done, total=total, progress=min(99, pct),
-                           message=message or (str(done) + "/" + str(total)))
-    return cb
+    return jobs.progress_cb(jid)
 
 
 def _finish(jid: str, status: str, result=None, error: str | None = None) -> None:
-    with _JOBS_LOCK:
-        job = JOBS.get(jid)
-        if job:
-            job.update(status=status, result=result, error=error,
-                       progress=100 if status == "done" else job.get("progress", 0),
-                       message="完成" if status == "done" else (error or "失败"),
-                       finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    jobs.finish(jid, status, result=result, error=error)
 
 
 def _run_async(jid: str, fn) -> str:
-    def worker() -> None:
-        try:
-            _finish(jid, "done", result=fn())
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("imgtag 任务失败 %s：%s", jid, exc)
-            _finish(jid, "failed", error=str(exc))
-    threading.Thread(target=worker, daemon=True, name="imgtag-" + jid).start()
-    return jid
+    return jobs.run_async(jid, fn, name="imgtag")
 
 
 def get_job(jid: str) -> dict | None:
-    with _JOBS_LOCK:
-        job = JOBS.get(jid)
-        return dict(job) if job else None
+    return jobs.get_job(jid)
 
 
 def list_jobs(limit: int = 30) -> list[dict]:
-    with _JOBS_LOCK:
-        items = sorted(JOBS.values(), key=lambda j: j["_ts"], reverse=True)
-        return [{k: v for k, v in j.items() if k not in ("result", "_ts")} for j in items[:limit]]
+    return jobs.list_jobs(limit)
 
 
 # ---- 启动任务（立即返回 job_id，结果放在 job["result"]） ----

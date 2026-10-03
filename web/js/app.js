@@ -240,20 +240,27 @@ const App = {
     };
   },
 
-  /** 重新扫描当前目录（只标记丢失，弹窗询问是否清理） */
+  /**
+   * 重新扫描当前目录（后台任务 + 进度条；只标记丢失，扫完弹窗询问是否清理）。
+   * 扫描可能要遍历上千个目录（网络盘上一两分钟），所以必须给实时反馈——
+   * 以前是同步请求，点完页面毫无动静，看起来像卡死。
+   */
   async rescanCurrent() {
     if (!this.state.currentFolderId) {
       toast("请先在左侧选择一个目录", "err");
       return;
     }
-    try {
-      const res = await API.post("/api/library/rescan", { folder_id: this.state.currentFolderId });
-      await TreeView.refresh();
-      await Gallery.load(true);
-      this.showRescanResult(res, this.state.currentFolderId);
-    } catch (e) {
-      toast("扫描失败：" + e.message, "err");
-    }
+    const fid = this.state.currentFolderId;
+    await JobProgress.run(
+      "重新扫描目录",
+      () => API.post("/api/library/rescan", { folder_id: fid }),
+      async (res) => {
+        await TreeView.refresh();
+        await Gallery.load(true);
+        this.showRescanResult(res, fid);
+      },
+      "/api/library/jobs/",
+    );
   },
 
   /**

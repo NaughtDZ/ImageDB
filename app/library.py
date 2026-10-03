@@ -21,6 +21,7 @@ import logging
 import os
 import time
 
+from . import jobs
 from .database import (chunk_ids, delete, execute, execute_rowcount, executemany,
                       query_all, query_one)
 from .imagetag import is_sidecar
@@ -520,7 +521,7 @@ def _sync_dir_status(folder_db_id: int, dir_path: str, reason: str = "rescan:not
     return miss, ok, 0
 
 
-def rescan_folder(folder_id: int) -> dict:
+def rescan_folder(folder_id: int, progress_cb=None) -> dict:
     """重新扫描某个目录子树（**用户显式操作** / 只标记、不删除）：
     - 磁盘上新增的目录/媒体 → 补录；
     - 磁盘上已消失的媒体 → 标记 status='missing'（保留记录/标签/缩略图）；
@@ -531,6 +532,10 @@ def rescan_folder(folder_id: int) -> dict:
     这是**唯一**会把记录标记为丢失的地方（另一处是用户主动删除）。
     返回 {added, missing, recovered, dir_missing, root_offline, dirs_unknown}。
     真正删除记录请用 purge_missing()（用户显式确认后）。
+
+    progress_cb(done, total, message)：按目录上报进度。网络盘上一个目录要几十毫秒，
+    几千个目录就是一两分钟——所以这个函数通常由 start_rescan() 放到后台线程里跑，
+    前端轮询进度条，避免"点下去没反应"。
     """
     folder = query_one("SELECT * FROM folders WHERE id = ?", (folder_id,))
     if not folder:
@@ -551,7 +556,15 @@ def rescan_folder(folder_id: int) -> dict:
         return {"added": 0, "missing": missing, "recovered": 0, "dirs_unknown": 0,
                 "dir_missing": True, "root_offline": False}
 
+    dirs = _subtree_folder_ids(folder_id)
+    total = len(dirs) + 1          # +1 = 补录新增文件那一步
+
+    def report(done: int, msg: str) -> None:
+        if progress_cb:
+            progress_cb(done, total, msg)
+
     # 1. 补录磁盘上新增的目录与媒体
+    report(0, "正在检查新增文件…")
     seen: set[str] = {os.path.realpath(folder["path"])}
     _fa, added = _walk_and_insert(folder["path"], folder_id, seen)
 
@@ -559,10 +572,12 @@ def rescan_folder(folder_id: int) -> dict:
     missing = 0
     recovered = 0
     unknown = 0
-    for f in _subtree_folder_ids(folder_id):
-        frow = query_one("SELECT path FROM folders WHERE id = ?", (f,))
+    for i, f in enumerate(dirs, 1):
+        frow = query_one("SELECT name, path FROM folders WHERE id = ?", (f,))
         if not frow:
+            report(i, "正在扫描：%d/%d" % (i, total))
             continue
+        report(i, "正在扫描：" + (frow["name"] or frow["path"]))
         st = probe_dir(frow["path"])
         if st == "unknown":
             unknown += 1
@@ -574,9 +589,27 @@ def rescan_folder(folder_id: int) -> dict:
         missing += m
         recovered += o
         unknown += u
+    report(total, "扫描完成")
 
     return {"added": added, "missing": missing, "recovered": recovered,
             "dirs_unknown": unknown, "dir_missing": False, "root_offline": False}
+
+
+def start_rescan(folder_id: int) -> str:
+    """后台「重新扫描」：立即返回 job_id，前端轮询进度。
+
+    为什么放后台：网络盘上一个目录要几十毫秒，几千个目录就是一两分钟，
+    同步跑会让页面全程无反应（用户会以为卡死）。任务结束后 result 即
+    rescan_folder() 的返回值，供前端弹「新增 X · 丢失 Y · 是否清理」对话框。
+    """
+    folder = query_one("SELECT name FROM folders WHERE id = ?", (folder_id,))
+    label = "重新扫描：" + ((folder["name"] if folder else "") or ("目录 " + str(folder_id)))
+    jid = jobs.new_job("scan", label)
+    return jobs.run_async(
+        jid,
+        lambda: rescan_folder(folder_id, jobs.progress_cb(jid)),
+        name="scan",
+    )
 
 
 def purge_missing(folder_id: int) -> dict:
