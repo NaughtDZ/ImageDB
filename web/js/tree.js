@@ -9,8 +9,11 @@
  *      都不会丢失已展开的子目录（修复"点子目录整树收起"问题）。
  * ============================================================ */
 const TreeView = {
+  _refreshSeq: 0,
+  _selectionSeq: 0,
   /** 刷新目录树（重新请求后端） */
   async refresh() {
+    const seq = ++this._refreshSeq;
     // 先把「正在加载」显示出来，避免网络盘/大库时界面像卡死（数据到了再整体替换）
     const box = document.getElementById("tree");
     if (box && box.children.length === 0) {
@@ -18,12 +21,13 @@ const TreeView = {
     }
     try {
       const data = await API.get("/api/tree");
+      if (seq !== this._refreshSeq) return;
       App.state.tree = data.tree || [];
       App.state.missingTotal = data.missing_total || 0;
       this.render();
       App.updateMissingBadge();   // 同步「只看丢失」角标
     } catch (e) {
-      toast("加载目录树失败：" + e.message, "err");
+      if (seq === this._refreshSeq) toast("加载目录树失败：" + e.message, "err");
     }
   },
 
@@ -37,6 +41,7 @@ const TreeView = {
     allNode.dataset.folderId = "all";
     allNode.innerHTML = '<span class="caret">▾</span><span class="label">📁 全部媒体</span>';
     allNode.onclick = () => {
+      ++this._selectionSeq;
       App.state.currentFolderId = null;
       Gallery.load(true);
       this.updateActiveHighlight(null);
@@ -60,9 +65,9 @@ const TreeView = {
   /** 就地标注某节点为「离线」或「丢失」（不重新拉取整棵树） */
   markNode(div, node, kind) {
     div.classList.remove("missing", "offline");
-    div.classList.add(kind);
+    if (kind) div.classList.add(kind);
     const label = div.querySelector(".label");
-    if (label) label.textContent = (kind === "offline" ? "💤 " : "🚫 ") + node.name;
+    if (label) label.textContent = (kind === "offline" ? "💤 " : kind === "missing" ? "🚫 " : "📁 ") + node.name;
   },
 
   renderNode(parent, node, depth) {
@@ -86,8 +91,10 @@ const TreeView = {
     // 点击目录：只读探测磁盘存在性（**绝不改库、绝不标记录**），再切换筛选
     div.onclick = async (e) => {
       e.stopPropagation();
+      const seq = ++this._selectionSeq;
       try {
         const res = await API.post("/api/library/check", { folder_id: node.id });
+        if (seq !== this._selectionSeq) return;
         if (res.root_offline) {
           toast("所在盘/根目录当前不可达（未挂载）：" + node.path, "err");
           this.markNode(div, node, "offline");
@@ -101,6 +108,7 @@ const TreeView = {
         // 注意：这里不整树 refresh —— 目录树是纯数据库读取、不逐目录 stat，
         // 刷新反而会把刚判定出的标记冲掉；直接就地标注即可。
       } catch (err) { /* 网络错误不阻塞切换 */ }
+      if (seq !== this._selectionSeq) return;
       App.state.currentFolderId = node.id;
       Gallery.load(true);
       // 只更新高亮，不重建整树（保留展开状态）

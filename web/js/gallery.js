@@ -30,7 +30,8 @@ const Gallery = {
   _THUMB_CACHE_MAX: 400,
   // 当前批次缩略图请求的控制器（翻页时 abort，丢弃旧页未完成请求）
   _abortCtrl: null,
-  _loading: new Set(),   // 正在加载的 mediaId 集合（去重，避免重复请求）
+  _requestSeq: 0,
+  _loading: new Map(),   // mediaId -> 当前加载器（去重并隔离旧回调）
 
   /** 缓存一张已加载的缩略图（LRU） + 记录到浏览器级 */
   cacheThumb(id, imgEl) {
@@ -51,7 +52,9 @@ const Gallery = {
   },
 
   /** 加载媒体列表：翻页时先 abort 旧页缩略图请求，再渲染目标页 */
-  async load(reset) {
+  async load(reset, preserveSelection = false) {
+    const requestSeq = ++this._requestSeq;
+    if (reset) App.state.page = 1;
     // 翻页：中断上一批缩略图加载（丢弃旧页请求，优先目标页）
     this.abortThumbLoads();
 
@@ -69,17 +72,26 @@ const Gallery = {
 
     try {
       const data = await API.get("/api/media?" + params.toString());
+      if (requestSeq !== this._requestSeq) return;
       App.state.total = data.total;
       App.state.items = data.items;
-      if (reset) App.state.page = 1;
-      App.state.selected.clear();
-      App.state.lastAnchor = null;
+      if (preserveSelection) {
+        const visibleIds = new Set(data.items.map(item => item.id));
+        for (const id of App.state.selected) {
+          if (!visibleIds.has(id)) App.state.selected.delete(id);
+        }
+        if (!visibleIds.has(App.state.lastAnchor)) App.state.lastAnchor = null;
+      } else {
+        App.state.selected.clear();
+        App.state.lastAnchor = null;
+      }
       // 1) 立即渲染卡片框架（文件名等），不阻塞
       this.render();
       // 2) 立即更新 UI 状态（页码/统计/选择）——优先于缩略图加载，绝不因缩略图中断
       this.updatePager();
       this.updateResultInfo();
       this.updateSelInfo();
+      SidePanel.refresh();
       App.updateMissingBadge();   // 「只看丢失」按钮的角标随范围/结果刷新
       this.scrollTop();
       this.saveBrowseState();
@@ -92,12 +104,16 @@ const Gallery = {
       }
     } catch (e) {
       // 注意：外部丢失不再自动删记录，后端也不会返回 410；这里只做一般错误提示
-      toast("加载失败：" + e.message, "err");
+      if (requestSeq === this._requestSeq) toast("加载失败：" + e.message, "err");
     }
   },
 
   /** 中断当前批次所有未完成的缩略图请求 */
   abortThumbLoads() {
+    if (this._thumbObserver) {
+      this._thumbObserver.disconnect();
+      this._thumbObserver = null;
+    }
     if (this._abortCtrl) {
       try { this._abortCtrl.abort(); } catch (e) {}
       this._abortCtrl = null;
@@ -132,15 +148,16 @@ const Gallery = {
     // 其余交给 IntersectionObserver（滚动时加载）
     if (this._thumbObserver) {
       this._thumbObserver.disconnect();
-    } else if ("IntersectionObserver" in window) {
+    }
+    if ("IntersectionObserver" in window) {
       this._thumbObserver = new IntersectionObserver((entries) => {
         for (const entry of entries) {
           if (entry.isIntersecting) {
             const im = entry.target;
             const id = im.closest(".media-card")?.dataset?.id;
-            if (id && im.dataset.loaded !== "1" && this._abortCtrl) {
-              this.loadOneThumb(im, id, this._abortCtrl.signal);
-              this._thumbObserver.unobserve(im);
+            if (id && im.isConnected && im.dataset.loaded !== "1" && !signal.aborted) {
+              this.loadOneThumb(im, id, signal);
+              this._thumbObserver?.unobserve(im);
             }
           }
         }
@@ -155,7 +172,7 @@ const Gallery = {
   /** 加载单个缩略图（内存缓存命中则秒显，否则请求） */
   loadOneThumb(im, id, signal) {
     // 已在加载中则跳过（去重）
-    if (this._loading.has(id)) return;
+    if (signal?.aborted || !im.isConnected || this._loading.has(id)) return;
     const cached = this.getCachedThumb(id);
     if (cached && cached.complete && cached.naturalWidth > 0) {
       // 内存缓存命中：直接复用 src，秒显
@@ -165,20 +182,22 @@ const Gallery = {
       return;
     }
     // 未命中：发起请求（带 signal 支持中断）
-    this._loading.add(id);
     const url = "/api/media/" + id + "/thumbnail";
     const worker = new Image();
-    worker.signal = signal;
-    if (signal) {
-      // 中断时取消
-      signal.addEventListener("abort", () => {
-        worker.src = "";   // 断开加载
-        this._loading.delete(id);
-      }, { once: true });
-    }
+    this._loading.set(id, worker);
+    const valid = () => !signal?.aborted && im.isConnected && this._loading.get(id) === worker;
+    const finish = () => {
+      if (this._loading.get(id) === worker) this._loading.delete(id);
+      signal?.removeEventListener("abort", abort);
+      worker.onload = worker.onerror = null;
+    };
+    const abort = () => { finish(); worker.src = ""; };
+    signal?.addEventListener("abort", abort, { once: true });
     worker.onload = () => {
-      this._loading.delete(id);
-      // 更新卡片 img（若 DOM 还在），并写缓存
+      const current = valid();
+      finish();
+      if (!current) return;
+      // 仅当前批次仍在 DOM 中的卡片可以接收回调。
       im.src = worker.src;
       im.dataset.loaded = "1";
       im.style.opacity = "1";
@@ -186,7 +205,9 @@ const Gallery = {
     };
     worker.onerror = () => {
       // 缩略图请求本身失败（后端报错/网络断）→ 就地显示内置占位图，不留破图图标
-      this._loading.delete(id);
+      const current = valid();
+      finish();
+      if (!current) return;
       const box = im.parentElement;
       if (box && !box.querySelector("svg")) {
         box.classList.add("missing-thumb");
@@ -284,9 +305,7 @@ const Gallery = {
         App.state.selected.clear();
         App.state.selected.add(item.id);
         App.state.lastAnchor = item.id;
-        this.render();
-        // 重新加载缩略图（因为 render 重建了 DOM）
-        if (this._abortCtrl) this.loadVisibleThumbs(this._abortCtrl.signal);
+        this.updateSelectionClasses();
       }
       this.updateSelInfo();
       SidePanel.open();
@@ -363,22 +382,22 @@ const Gallery = {
       });
     }
     if (pageSizeInput) {
-      const saved = localStorage.getItem("imagedb_page_size");
-      if (saved) {
-        const v = parseInt(saved, 10);
-        if (v >= 10 && v <= 500) pageSizeInput.value = v;
-      }
+      pageSizeInput.max = "200";
+      let saved;
+      try { saved = localStorage.getItem("imagedb_page_size"); } catch (e) {}
+      const initial = Math.max(10, Math.min(200, parseInt(saved || pageSizeInput.value, 10) || 60));
+      pageSizeInput.value = initial;
+      App.state.pageSize = initial;
+      try { localStorage.setItem("imagedb_page_size", String(initial)); } catch (e) {}
       pageSizeInput.addEventListener("change", () => {
         let v = parseInt(pageSizeInput.value, 10) || 60;
-        v = Math.max(10, Math.min(500, v));
+        v = Math.max(10, Math.min(200, v));
         pageSizeInput.value = v;
         App.state.pageSize = v;
-        localStorage.setItem("imagedb_page_size", String(v));
+        try { localStorage.setItem("imagedb_page_size", String(v)); } catch (e) {}
         App.state.page = 1;
         this.load(true);
       });
-      const initV = parseInt(pageSizeInput.value, 10) || 60;
-      if (App.state.pageSize !== initV) App.state.pageSize = initV;
     }
   },
 
@@ -412,8 +431,7 @@ const Gallery = {
     for (let i = a; i <= b; i++) {
       App.state.selected.add(ids[i]);
     }
-    this.render();
-    if (this._abortCtrl) this.loadVisibleThumbs(this._abortCtrl.signal);
+    this.updateSelectionClasses();
     this.updateSelInfo();
   },
 
@@ -482,8 +500,7 @@ const Gallery = {
       box.remove();
       box = null;
       document.body.classList.remove("selecting");
-      this.render();
-      if (this._abortCtrl) this.loadVisibleThumbs(this._abortCtrl.signal);
+      this.updateSelectionClasses();
       this.updateSelInfo();
       SidePanel.open();
       SidePanel.refresh();
@@ -494,6 +511,13 @@ const Gallery = {
   updateResultInfo() {
     document.getElementById("result-info").textContent =
       "共 " + App.state.total + " 个素材 · 第 " + App.state.page + " 页";
+  },
+
+  /** 只更新选择样式，不替换缩略图节点及其在途加载。 */
+  updateSelectionClasses() {
+    document.querySelectorAll("#gallery .media-card").forEach(card => {
+      card.classList.toggle("selected", App.state.selected.has(Number(card.dataset.id)));
+    });
   },
 
   /** 更新选择信息 */
@@ -507,8 +531,7 @@ const Gallery = {
     App.state.selected.clear();
     App.state.lastAnchor = null;
     this.updateSelInfo();
-    this.render();
-    if (this._abortCtrl) this.loadVisibleThumbs(this._abortCtrl.signal);
+    this.updateSelectionClasses();
     SidePanel.refresh();
   },
 };

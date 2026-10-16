@@ -60,12 +60,13 @@ def make_thumbnail(media_id: int, path: str, mtype: str,
         if mtype == "image":
             with Image.open(path) as im:
                 im = ImageOps.exif_transpose(im)  # 遵循 EXIF 方向
+                original_size = im.size  # EXIF 方向校正后的原图尺寸，不是缩略图尺寸
                 im = im.convert("RGB")
                 im.thumbnail((thumb_size, thumb_size), Image.LANCZOS)
                 im.save(out_abs, "JPEG", quality=85)
                 # 顺带记录图片尺寸
                 execute("UPDATE media_items SET width = ?, height = ? WHERE id = ?",
-                        (im.size[0], im.size[1], media_id))
+                        (original_size[0], original_size[1], media_id))
 
         elif mtype == "video":
             if not HAS_CV2:

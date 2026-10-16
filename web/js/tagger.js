@@ -11,9 +11,14 @@ const Tagger = {
   scopeIds: [],        // 目标 id
   jobId: null,         // 当前任务 id
   pollTimer: null,     // 进度轮询定时器
+  _pollGeneration: 0,
+  _viewGeneration: 0,
+  _visible: false,
+  _starting: false,
 
   /** 打开打标对话框（默认范围：选中媒体） */
   async open() {
+    if (this.jobId || this._starting) return this.showDialog();
     const sel = [...App.state.selected];
     if (sel.length === 0 && App.state.currentFolderId === null) {
       toast("请先选择要打标的媒体，或在左侧选择目录", "err");
@@ -26,28 +31,44 @@ const Tagger = {
       this.scopeType = "folder";
       this.scopeIds = [App.state.currentFolderId];
     }
-    await this.loadTools();
-    this.renderTools();   // 渲染工具列表（修复：此前未调用导致工具显示为空）
-    this.renderScope();
-    this.jobId = null;
-    document.getElementById("tagger-progress-row").style.display = "none";
-    document.getElementById("tagger-cancel-job").style.display = "none";
-    document.getElementById("tagger-msg").textContent = "";
-    document.getElementById("tagger-modal").classList.remove("hidden");
+    return this.showDialog();
   },
 
-  /** 以整个目录为范围打开（树右键菜单调用） */
+  /** 已有任务时重连原范围，不用新的目录覆盖它。 */
   async openWithFolder(folderId) {
-    this.scopeType = "folder";
-    this.scopeIds = [folderId];
+    if (!this.jobId && !this._starting) {
+      this.scopeType = "folder";
+      this.scopeIds = [folderId];
+    }
+    return this.showDialog();
+  },
+
+  async showDialog() {
+    const generation = ++this._viewGeneration;
+    this._visible = true;
     await this.loadTools();
-    this.renderTools();   // 渲染工具列表（修复：此前未调用导致工具显示为空）
+    if (!this._visible || generation !== this._viewGeneration) return;
+    this.renderTools();
     this.renderScope();
-    this.jobId = null;
-    document.getElementById("tagger-progress-row").style.display = "none";
-    document.getElementById("tagger-cancel-job").style.display = "none";
-    document.getElementById("tagger-msg").textContent = "";
+    document.getElementById("tagger-start").disabled = !!this.jobId || this._starting;
+    document.getElementById("tagger-progress-row").style.display = this.jobId ? "" : "none";
+    document.getElementById("tagger-cancel-job").style.display = this.jobId ? "" : "none";
+    document.getElementById("tagger-msg").textContent = this.jobId ? "正在重新连接任务…" : this._starting ? "正在启动…" : "";
     document.getElementById("tagger-modal").classList.remove("hidden");
+    if (this.jobId) this.pollProgress();
+  },
+
+  stopPolling() {
+    ++this._pollGeneration;
+    if (this.pollTimer) clearTimeout(this.pollTimer);
+    this.pollTimer = null;
+  },
+
+  close() {
+    this._visible = false;
+    ++this._viewGeneration;
+    this.stopPolling();
+    document.getElementById("tagger-modal").classList.add("hidden");
   },
 
   /** 加载工具列表 */
@@ -106,11 +127,14 @@ const Tagger = {
 
   /** 启动打标 */
   async start() {
+    if (this.jobId || this._starting) return;
     const selected = document.querySelector("#tagger-tools .tool-option.selected");
     if (!selected) { toast("请选择打标工具", "err"); return; }
     const tool = selected.dataset.tool;
     const overwrite = document.getElementById("tagger-overwrite").checked;
 
+    this._starting = true;
+    document.getElementById("tagger-start").disabled = true;
     try {
       const res = await API.post("/api/tagging/run", {
         tool,
@@ -118,26 +142,33 @@ const Tagger = {
         scope_ids: this.scopeIds,
         overwrite,
       });
+      if (!res.job_id) throw new Error("未返回任务 id");
       this.jobId = res.job_id;
       document.getElementById("tagger-start").disabled = true;
       document.getElementById("tagger-cancel-job").style.display = "";
       document.getElementById("tagger-progress-row").style.display = "";
       document.getElementById("tagger-msg").textContent = "任务已启动…";
-      this.pollProgress();
+      if (this._visible) this.pollProgress();
     } catch (e) {
       toast("启动打标失败：" + e.message, "err");
       document.getElementById("tagger-msg").className = "msg err";
       document.getElementById("tagger-msg").textContent = e.message;
+    } finally {
+      this._starting = false;
+      document.getElementById("tagger-start").disabled = !!this.jobId;
     }
   },
 
   /** 轮询任务进度 */
   pollProgress() {
-    if (this.pollTimer) clearInterval(this.pollTimer);
-    this.pollTimer = setInterval(async () => {
-      if (this.jobId === null) { clearInterval(this.pollTimer); return; }
+    this.stopPolling();
+    const generation = this._pollGeneration, jobId = this.jobId;
+    const current = () => this._visible && generation === this._pollGeneration && jobId === this.jobId;
+    const tick = async () => {
+      if (!jobId || !current()) return;
       try {
-        const job = await API.get("/api/tagging/jobs/" + this.jobId);
+        const job = await API.get("/api/tagging/jobs/" + jobId);
+        if (!current()) return;
         const bar = document.getElementById("tagger-progress-bar");
         const text = document.getElementById("tagger-progress-text");
         if (job.total > 0) {
@@ -147,8 +178,8 @@ const Tagger = {
           text.textContent = job.message || "";
         }
         if (["done", "failed", "cancelled"].includes(job.status)) {
-          clearInterval(this.pollTimer);
-          this.pollTimer = null;
+          this.stopPolling();
+          this.jobId = null;
           document.getElementById("tagger-start").disabled = false;
           document.getElementById("tagger-cancel-job").style.display = "none";
           const msg = document.getElementById("tagger-msg");
@@ -165,13 +196,16 @@ const Tagger = {
           }
           // 刷新画廊与右侧标签栏（打标后标签已变化）
           Gallery.load(true).then(() => SidePanel.refresh());
+          return;
         }
+        this.pollTimer = setTimeout(tick, 1000);
       } catch (e) {
-        // 网络错误时停止轮询避免刷屏
-        clearInterval(this.pollTimer);
-        this.pollTimer = null;
+        if (!current()) return;
+        this.stopPolling();
+        document.getElementById("tagger-msg").textContent = "读取进度失败：" + e.message + "（关闭后重开可重连）";
       }
-    }, 1000);
+    };
+    return tick();
   },
 
   /** 取消任务 */
@@ -190,10 +224,7 @@ const Tagger = {
     document.getElementById("tagger-start").onclick = () => this.start();
     document.getElementById("tagger-cancel-job").onclick = () => this.cancel();
     document.querySelectorAll("[data-close='tagger-modal']").forEach(el => {
-      el.onclick = () => {
-        document.getElementById("tagger-modal").classList.add("hidden");
-        if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
-      };
+      el.onclick = () => this.close();
     });
   },
 };

@@ -23,13 +23,19 @@ from .database import query_one, transaction
 
 logger = logging.getLogger("imagedb.tagstats")
 
-TTL_SEC = 60.0            # 缓存寿命（秒）：过期后由下一次访问触发后台刷新
-FIRST_WAIT_SEC = 10.0     # 首次（空表）同步等待上限
+TTL_SEC = 60.0
+FIRST_WAIT_SEC = 10.0
+COALESCE_SEC = 0.2       # Bounded delay batches bursts without starving continuous edits.
 
 _lock = threading.Lock()
+_build_lock = threading.Lock()
+_idle = threading.Event()
+_idle.set()
 _rebuilding = False
 _last_rebuild = 0.0
-_dirty = True
+_generation = 0
+_built_generation = -1
+_initialized = False
 
 
 def _rebuild_sql(conn) -> int:
@@ -42,74 +48,93 @@ def _rebuild_sql(conn) -> int:
     return conn.execute("SELECT COUNT(*) AS c FROM tag_counts").fetchone()[0]
 
 
+
 def rebuild_now() -> int:
-    """同步全量重建（供测试/维护用），返回写入的标签数。"""
-    n = transaction(_rebuild_sql)
-    global _last_rebuild, _dirty
-    with _lock:
-        _last_rebuild = time.time()
-        _dirty = False
+    """Synchronous rebuild. Only acknowledge changes captured before this build.
+
+    The build lock serializes SQL + publication with other synchronous/background
+    builders; a mark during either phase stays pending, even if SQL included it.
+    """
+    global _last_rebuild, _built_generation, _initialized
+    with _build_lock:
+        with _lock:
+            generation = _generation
+        n = transaction(_rebuild_sql)
+        with _lock:
+            _last_rebuild = time.monotonic()
+            _built_generation = generation
+            _initialized = True
     logger.info("标签计数缓存已重建：%d 个标签", n)
     return n
 
 
-def _worker() -> None:
-    global _rebuilding, _last_rebuild, _dirty
+def _worker(delay: float = 0.0) -> None:
+    global _rebuilding
     try:
-        n = transaction(_rebuild_sql)
-        logger.info("标签计数缓存已重建：%d 个标签", n)
-        with _lock:
-            _last_rebuild = time.time()
-            _dirty = False
+        while True:
+            if delay:
+                time.sleep(delay)
+            rebuild_now()
+            with _lock:
+                if _built_generation == _generation:
+                    # Check and release atomically: a later mark will start a worker.
+                    _rebuilding = False
+                    _idle.set()
+                    return
+            delay = COALESCE_SEC
     except Exception as exc:  # noqa: BLE001
         logger.warning("标签计数缓存重建失败（沿用旧值）：%s", exc)
-    finally:
         with _lock:
+            # Do not acknowledge the generation on failure. Next access retries.
             _rebuilding = False
+            _idle.set()
 
 
-def _kick() -> bool:
-    """启动后台重算（已在跑则跳过）。返回是否真的启动了。"""
+def _kick(delay: float = 0.0) -> bool:
+    """Start at most one background builder (including its coalescing wait)."""
     global _rebuilding
     with _lock:
         if _rebuilding:
             return False
         _rebuilding = True
-    threading.Thread(target=_worker, daemon=True, name="tagcounts").start()
+        _idle.clear()
+    try:
+        threading.Thread(target=_worker, args=(delay,), daemon=True, name="tagcounts").start()
+    except Exception:
+        with _lock:
+            _rebuilding = False
+            _idle.set()
+        raise
     return True
 
 
 def warm() -> None:
-    """启动时预热：直接丢后台重建，不阻塞。"""
+    """Warm in the background without blocking startup."""
     _kick()
 
 
 def mark_dirty() -> None:
-    """标签数据发生变化（增删标签 / 删除媒体 / 打标完成等）→ 立即后台重算。"""
-    global _dirty
+    """Record every committed change; coalesce bursts and never clear a newer mark."""
+    global _generation
     with _lock:
-        _dirty = True
-    _kick()
+        _generation += 1
+    _kick(delay=COALESCE_SEC)
 
 
 def ensure_fresh(ttl: float = TTL_SEC) -> None:
-    """确保计数缓存可用：空表 → 同步等一次；过期/脏 → 后台刷新（不阻塞）。"""
-    try:
-        row = query_one("SELECT COUNT(*) AS c FROM tag_counts")
-    except Exception:  # noqa: BLE001
-        return
-    n = row["c"] if row else 0
-    if n == 0:
-        # 首次：同步等重建完成，避免面板上所有计数都显示 0
-        _kick()
-        deadline = time.time() + FIRST_WAIT_SEC
-        while time.time() < deadline:
-            with _lock:
-                if not _rebuilding:
-                    return
-            time.sleep(0.05)
-        return
+    """Wait once for a genuinely uninitialized empty cache; otherwise refresh async."""
     with _lock:
-        stale = _dirty or (time.time() - _last_rebuild) > ttl
-    if stale:
+        initialized = _initialized
+        stale = (_built_generation != _generation or
+                 time.monotonic() - _last_rebuild > ttl)
+    first_empty = False
+    if not initialized:
+        try:
+            row = query_one("SELECT COUNT(*) AS c FROM tag_counts")
+        except Exception:  # noqa: BLE001
+            return
+        first_empty = not row or row["c"] == 0
+    if stale or first_empty:
         _kick()
+    if first_empty:
+        _idle.wait(FIRST_WAIT_SEC)

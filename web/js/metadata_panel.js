@@ -7,10 +7,12 @@
  *   3. 附加数据分区高度、侧边栏宽度均可拖拽调节（尺寸存 localStorage）。
  * ============================================================ */
 const MetadataPanel = {
+  _requestSeq: 0,
   _cache: new Map(),     // media_id -> {exif, iptc, xmp}
 
   /** 刷新：取选中集合第一张的附加数据并渲染 */
   async refresh(sel) {
+    const seq = ++this._requestSeq;
     const status = document.getElementById("meta-status");
     const groups = document.getElementById("meta-groups");
     if (!sel || sel.length === 0) {
@@ -30,9 +32,11 @@ const MetadataPanel = {
     groups.innerHTML = '<div class="hint">读取中…</div>';
     try {
       const data = await API.get("/api/media/" + id + "/metadata");
+      if (seq !== this._requestSeq) return;
       this._cache.set(id, data);
       this.render(data);
     } catch (e) {
+      if (seq !== this._requestSeq) return;
       groups.innerHTML = "";
       status.textContent = "读取失败：" + (e.message || "未知错误");
       status.classList.remove("hidden");
@@ -112,7 +116,7 @@ const MetadataPanel = {
   },
 
   /** 清空缓存（重扫/数据变化后调用） */
-  clearCache() { this._cache.clear(); },
+  clearCache() { ++this._requestSeq; this._cache.clear(); },
 
   /** 初始化：拖拽条 + 恢复上次尺寸 */
   init() {

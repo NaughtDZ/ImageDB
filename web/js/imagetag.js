@@ -70,8 +70,7 @@ const Imagetag = {
     this._runJob("从 .imgtag 导入标签",
       () => API.post("/api/tags/import", { folder_id: App.state.currentFolderId, overwrite }),
       async (res) => {
-        toast("导入完成：匹配 " + (res.media || 0) + " 个媒体，新增 " + (res.tags || 0) + " 个标签" +
-              (res.files ? "（读取 " + res.files + " 个 .imgtag）" : ""), "ok");
+        this.showImportResult(res);
         await Gallery.load(true);
         await SidePanel.refresh();
       });
@@ -92,6 +91,24 @@ const Imagetag = {
     document.getElementById("imagetag-log-title").textContent = title;
     document.getElementById("imagetag-log").innerHTML = html;
     document.getElementById("imagetag-log-modal").classList.remove("hidden");
+  },
+
+  showImportResult(res) {
+    const errors = res.errors || [];
+    let html = '<div class="row">导入完成：匹配 ' + (res.media || 0) + ' 个媒体，新增 ' +
+      (res.tags || 0) + ' 个标签（读取 ' + (res.files || 0) + ' 个 .imgtag）。</div>';
+    if (errors.length) {
+      html += '<div class="row err">⚠️ 有 ' + errors.length + ' 项导入失败或跳过：</div><ul>';
+      for (const error of errors) {
+        html += '<li><span class="path">' + escapeHtml(error.dir || "") +
+          (error.filename ? ' / ' + escapeHtml(error.filename) : '') + '</span> — ' +
+          escapeHtml(error.error || "未知错误") + '</li>';
+      }
+      html += '</ul>';
+    } else {
+      html += '<div class="row ok">全部导入完成。</div>';
+    }
+    this._openLog(errors.length ? "导入完成（有错误）" : "导入完成", html);
   },
 
   showExportResult(res) {

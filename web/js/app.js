@@ -20,6 +20,8 @@ const App = {
   /** 应用初始化 */
   async init() {
     this.bindEvents();
+    // 恢复分页设置必须早于首次列表请求。
+    Gallery.initPager();
     // 启动时优先读取数据库构建目录树
     await TreeView.refresh();
     // 加载第一页媒体
@@ -32,8 +34,6 @@ const App = {
     Settings.init();
     // 初始化画廊框选
     Gallery.initBoxSelect();
-    // 初始化分页导航
-    Gallery.initPager();
     // 初始化缩略图大小滑块
     Gallery.initThumbSlider();
     // 初始化右侧标签侧边栏
@@ -229,8 +229,17 @@ const App = {
     document.getElementById("rescan-purge").onclick = async () => {
       try {
         const r = await API.post("/api/library/purge_missing", { folder_id: folderId });
-        toast("已从数据库删除 " + r.removed + " 条丢失记录", "ok");
-        modal.classList.add("hidden");
+        const retained = r.retained || 0;
+        const message = "已从数据库删除 " + r.removed + " 条丢失记录" +
+          (retained ? "；保留 " + retained + " 条（当前存在或无法安全确认缺失）" : "");
+        toast(message, retained ? "err" : "ok");
+        if (retained) {
+          summary.textContent = message;
+          purgeBtn.style.display = "none";
+          keepBtn.textContent = "知道了";
+        } else {
+          modal.classList.add("hidden");
+        }
         await TreeView.refresh();
         await Gallery.load(true);
         SidePanel.refresh();
@@ -328,7 +337,10 @@ const App = {
       const res = await API.post("/api/media/trash", { media_ids: sel });
       // app_trash>0 表示已移入"应用内回收站"（可从回收站功能还原），否则为系统回收站
       const note = res.app_trash > 0 ? "（可从回收站功能还原）" : "";
-      toast((res.message || "已移到回收站") + note, "ok");
+      const errors = res.errors || [];
+      const recordsNote = res.records_only ? "（仅删除记录 " + res.records_only + " 项）" : "";
+      toast((res.message || "已处理 " + res.removed + " 项") + note + recordsNote +
+            (errors.length ? "；失败 " + errors.length + " 项：" + errors.join("；") : ""), errors.length ? "err" : "ok");
       this.state.selected.clear();
       this.state.lastAnchor = null;
       await Gallery.load(true);
@@ -359,7 +371,9 @@ const App = {
     if (ok !== "yes") return;
     try {
       const res = await API.post("/api/media/move", { media_ids: sel, dest_dir: dest });
-      toast("已移动 " + res.moved + " 个素材", "ok");
+      const errors = res.errors || [];
+      toast("已移动 " + res.moved + " 个素材" + (res.skipped ? "，跳过 " + res.skipped + " 项" : "") +
+            (errors.length ? "；失败 " + errors.length + " 项：" + errors.join("；") : ""), errors.length ? "err" : "ok");
       this.state.selected.clear();
       this.state.lastAnchor = null;
       await Gallery.load(true);

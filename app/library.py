@@ -5,8 +5,8 @@
 职责：
     1. 导入用户指定目录：递归扫描，把图片/视频路径与目录结构写入数据库；
     2. 重新扫描：把磁盘上新增的文件补录进来；
-    3. 缺失校验：检查数据库记录对应的文件/目录是否还在磁盘上，
-       不存在的自动从数据库删除（前台手动触发 + 后台定时触发）；
+    3. 显式重扫标记缺失但保留记录；恢复校验只恢复状态；
+       用户确认清理时再次校验，只有确认缺失才删除记录；
     4. 构建目录树：启动时优先从数据库读取（不访问磁盘，速度快）。
 
 设计说明：
@@ -23,7 +23,7 @@ import time
 
 from . import jobs
 from .database import (chunk_ids, delete, execute, execute_rowcount, executemany,
-                      query_all, query_one)
+                      query_all, query_one, transaction)
 from .imagetag import is_sidecar
 
 logger = logging.getLogger("imagedb.library")
@@ -91,11 +91,31 @@ def media_type_of(path: str) -> str | None:
 
 def _insert_folder(name: str, path: str, parent_id: int | None, is_root: int = 0) -> int:
     """插入目录记录（已存在则返回已有 id）。"""
-    row = query_one("SELECT id, is_root FROM folders WHERE path = ?", (path,))
+    row = query_one("SELECT id, is_root, parent_id FROM folders WHERE path = ?", (path,))
     if row:
         # 已存在：提升为根目录标记（幂等），保留父目录关系
         if is_root and not row["is_root"]:
             execute("UPDATE folders SET is_root = 1 WHERE id = ?", (row["id"],))
+        if parent_id is not None and row["parent_id"] is None:
+            # Attach a previously imported child, but never reparent an existing edge.
+            # Check + update share a transaction so concurrent imports cannot form a cycle.
+            def attach(conn):
+                parent = conn.execute("SELECT path FROM folders WHERE id = ?", (parent_id,)).fetchone()
+                if not parent or os.path.dirname(path) != parent["path"]:
+                    return
+                cur = parent_id
+                seen_ids = {row["id"]}
+                while cur is not None:
+                    if cur in seen_ids:
+                        return
+                    seen_ids.add(cur)
+                    ancestor = conn.execute("SELECT parent_id FROM folders WHERE id = ?", (cur,)).fetchone()
+                    if ancestor is None:
+                        return
+                    cur = ancestor["parent_id"]
+                conn.execute("UPDATE folders SET parent_id = ? WHERE id = ? AND parent_id IS NULL",
+                             (parent_id, row["id"]))
+            transaction(attach)
         return row["id"]
     return execute(
         "INSERT INTO folders(name, path, parent_id, is_root) VALUES (?, ?, ?, ?)",
@@ -147,12 +167,14 @@ def _walk_and_insert(dir_path: str, parent_db_id: int, seen: set[str],
         logger.warning("无法读取目录 %s：%s", dir_path, exc)
         return 0, 0
 
-    # 把刚拿到的目录项交给调用方（重扫用它就地判定 ok/missing，省掉第二次扫描）
+    # Reconcile identities before inserting. Do not swallow reconciliation failures:
+    # continuing after a failed update could create a duplicate record.
+    names = {e.name for e in entries}
+    handled_paths: set[str] = set()
     if dir_cb is not None:
-        try:
-            dir_cb(parent_db_id, {e.name for e in entries})
-        except Exception:  # noqa: BLE001
-            pass
+        handled_paths = dir_cb(parent_db_id, names) or set()
+    else:
+        _sync_with_names(parent_db_id, names, mark_missing=False, handled_paths=handled_paths)
 
     media_rows: list[tuple] = []
     subdirs: list[os.DirEntry] = []
@@ -165,7 +187,7 @@ def _walk_and_insert(dir_path: str, parent_db_id: int, seen: set[str],
             elif entry.is_file(follow_symlinks=False):
                 mtype = media_type_of(entry.path)
                 if mtype:
-                    if known_files is not None and entry.path in known_files:
+                    if entry.path in handled_paths or (known_files is not None and entry.path in known_files):
                         continue          # 已入库：不必再插，也不必取 stat
                     st = entry.stat(follow_symlinks=False)
                     media_rows.append((
@@ -193,7 +215,7 @@ def _walk_and_insert(dir_path: str, parent_db_id: int, seen: set[str],
             risky = entry.is_symlink() or entry.is_junction()
         except (OSError, AttributeError):
             risky = True
-        keys = [os.path.normcase(entry.path)]
+        keys = [os.path.normpath(entry.path)]
         if risky:
             keys.append(os.path.realpath(entry.path))
         if any(k in seen for k in keys):
@@ -310,7 +332,7 @@ def _prepare_parent_for_import(path: str) -> tuple[int | None, int]:
     # 收集 anc_path 与 parent_path 之间缺失的中间目录（不含 anc_path，含 parent_path），自上而下补建
     chain: list[str] = []
     cur = parent_path
-    while cur and os.path.normcase(os.path.normpath(cur)) != os.path.normcase(os.path.normpath(anc_path)):
+    while cur and os.path.normpath(cur) != os.path.normpath(anc_path):
         chain.append(cur)
         nxt = os.path.dirname(cur)
         if nxt == cur:   # 已到根，安全退出
@@ -394,8 +416,12 @@ def import_folder_progress(root_path: str, progress_cb=None) -> dict:
         except OSError as exc:
             logger.warning("无法读取目录 %s：%s", dir_path, exc)
             return
+        handled_paths: set[str] = set()
+        _sync_with_names(parent_db_id, {e.name for e in entries}, mark_missing=False,
+                         handled_paths=handled_paths)
         media_rows: list[tuple] = []
         subdirs: list[os.DirEntry] = []
+        processed = 0
         for entry in entries:
             try:
                 if entry.is_dir(follow_symlinks=False):
@@ -403,6 +429,9 @@ def import_folder_progress(root_path: str, progress_cb=None) -> dict:
                 elif entry.is_file(follow_symlinks=False):
                     mtype = media_type_of(entry.path)
                     if mtype:
+                        processed += 1
+                        if entry.path in handled_paths:
+                            continue
                         st = entry.stat(follow_symlinks=False)
                         media_rows.append((
                             parent_db_id, entry.path, entry.name, mtype,
@@ -417,7 +446,8 @@ def import_folder_progress(root_path: str, progress_cb=None) -> dict:
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 media_rows,
             )
-            done_counter["n"] += len(media_rows)
+        if processed:
+            done_counter["n"] += processed
             if progress_cb:
                 progress_cb(done_counter["n"])
 
@@ -548,19 +578,94 @@ def _mark_all_missing(folder_ids: list[int], reason: str = "mark") -> int:
     return n
 
 
-def _sync_with_names(folder_db_id: int, on_disk: set[str],
-                     reason: str = "rescan:not_found") -> tuple[int, int]:
-    """按**已经取得**的磁盘目录项，把该目录下媒体在 ok/missing 间同步（不删记录）。
+def _disk_name_match(path: str, filename: str, names: set[str], folded: dict
+                     ) -> tuple[str, str | None]:
+    """Exact spelling is the fast path; casefold only discovers possible aliases.
 
-    返回 (新标记为 missing 数, 恢复为 ok 数)。
-    与 _sync_dir_status 的区别：调用方已经 scandir 过了，这里不再重复扫描磁盘
-    （网络盘上实测量目录 1.4ms/次，1 万目录就是 15 秒）。
+    Only nonzero file identities (samefile semantics) prove an alias (including
+    case-sensitive Windows directories). No OS-wide case assumption or writes to
+    probe files. Failed/ambiguous identity probes are unknown, not missing.
+    """
+    if filename in names:
+        return "present", filename
+    candidates = folded.get(filename.casefold(), [])
+    if not candidates:
+        # Unicode casefold is not a filesystem collation table. An unusual
+        # spelling may still resolve; preserve it rather than inventing absence.
+        state = probe_file(path)
+        return ("absent" if state == "absent" else "unknown"), None
+    if len(candidates) != 1:
+        return "unknown", None
+    candidate = candidates[0]
+    try:
+        old_stat = os.stat(path)
+        new_stat = os.stat(os.path.join(os.path.dirname(path), candidate))
+        if not old_stat.st_ino or not new_stat.st_ino:
+            return "unknown", None  # Some filesystems do not expose file identity.
+        if os.path.samestat(old_stat, new_stat):
+            return "present", candidate
+    except FileNotFoundError:
+        # Recheck the old path: the candidate could have vanished mid-probe.
+        state = probe_file(path)
+        return ("absent" if state == "absent" else "unknown"), None
+    except OSError:
+        return "unknown", None
+    # Both spellings resolved to different objects, or the directory changed
+    # during the scan. Do not infer deletion from this inconsistent snapshot.
+    return "unknown", None
+
+
+def _folded_names(names: set[str]) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
+    for name in names:
+        result.setdefault(name.casefold(), []).append(name)
+    return result
+
+
+def _update_spelling(item: dict, name: str) -> bool:
+    """Preserve ID/tags; never merge pre-existing duplicate database identities."""
+    path = os.path.join(os.path.dirname(item["path"]), name)
+    if path == item["path"] and name == item["filename"]:
+        return True
+    return bool(execute_rowcount(
+        "UPDATE media_items SET path = ?, filename = ?, ext = ? WHERE id = ? AND path = ?"
+        " AND NOT EXISTS (SELECT 1 FROM media_items WHERE path = ? AND id != ?)",
+        (path, name, ext_of(path), item["id"], item["path"], path, item["id"]),
+    ))
+
+
+def _sync_with_names(folder_db_id: int, on_disk: set[str],
+                     reason: str = "rescan:not_found", *, mark_missing: bool = True,
+                     handled_paths: set[str] | None = None) -> tuple[int, int]:
+    """Sync an already-read directory, proving case aliases only on mismatches.
+
+    handled_paths also reserves uncertain case candidates for this scan, avoiding
+    duplicate insertion when identity cannot be proved. Imports never mark missing.
     """
     miss = 0
     ok = 0
-    for item in query_all("SELECT id, filename, status FROM media_items WHERE folder_id = ?",
+    folded = None
+    for item in query_all("SELECT id, path, filename, status FROM media_items WHERE folder_id = ?",
                           (folder_db_id,)):
-        want = "ok" if item["filename"] in on_disk else "missing"
+        if item["filename"] in on_disk:
+            state, name = "present", item["filename"]
+        else:
+            if folded is None:
+                folded = _folded_names(on_disk)
+            state, name = _disk_name_match(item["path"], item["filename"], on_disk, folded)
+        if state == "unknown":
+            if handled_paths is not None:
+                handled_paths.update(os.path.join(os.path.dirname(item["path"]), n)
+                                     for n in (folded.get(item["filename"].casefold()) or on_disk))
+            continue
+        if state == "present":
+            if handled_paths is not None:
+                handled_paths.add(os.path.join(os.path.dirname(item["path"]), name))
+            if not _update_spelling(item, name):
+                continue
+        elif not mark_missing:
+            continue
+        want = "ok" if state == "present" else "missing"
         if (item["status"] or "ok") != want:
             execute(
                 "UPDATE media_items SET status = ?,"
@@ -670,13 +775,15 @@ def rescan_folder(folder_id: int, progress_cb=None) -> dict:
     unknown = 0
     visited: set[int] = set()
 
-    def on_dir(fid: int, names: set[str]) -> None:
+    def on_dir(fid: int, names: set[str]) -> set[str]:
         """拿到目录项的同一时刻就地同步状态——不重复扫第二遍磁盘。"""
         nonlocal missing, recovered
         visited.add(fid)
-        m, o = _sync_with_names(fid, names)
+        handled: set[str] = set()
+        m, o = _sync_with_names(fid, names, handled_paths=handled)
         missing += m
         recovered += o
+        return handled
 
     # ---- 阶段 1（0~96%）：遍历磁盘 → 补录新增 + 就地同步 ok/missing ----
     # 这是全部耗时所在（万级目录在网络盘上要几十秒），**必须上报进度**，
@@ -723,7 +830,7 @@ def start_rescan(folder_id: int) -> str:
     """
     folder = query_one("SELECT name FROM folders WHERE id = ?", (folder_id,))
     label = "重新扫描：" + ((folder["name"] if folder else "") or ("目录 " + str(folder_id)))
-    jid = jobs.new_job("scan", label)
+    jid = jobs.new_job("scan", label, exclusive=True)
     return jobs.run_async(
         jid,
         lambda: rescan_folder(folder_id, jobs.percent_cb(jid)),
@@ -732,31 +839,86 @@ def start_rescan(folder_id: int) -> str:
 
 
 def purge_missing(folder_id: int) -> dict:
-    """删除某目录子树下所有 status='missing' 的媒体记录（**仅在用户显式确认后调用**）。
+    """Explicitly purge only still-missing records, never live/unknown files.
 
-    同时清理这些记录的缩略图缓存。返回 {removed}。
+    Require a freshly reachable imported root, a readable or confirmed absent
+    immediate parent, and a fresh absent-file probe. Cache directory snapshots,
+    not individual existence probes. Explicit remove APIs remain independent.
+    No filesystem/database operation can eliminate the final external recreate race.
+    Returns removed/retained counts, with retained split into live and unknown.
     """
     ids = _subtree_folder_ids(folder_id)
-    if not ids:
-        return {"removed": 0}
-    mids: list[int] = []
+    rows = []
     for chunk in chunk_ids(ids):
         ph = ",".join("?" * len(chunk))
-        mids.extend(r["id"] for r in query_all(
-            f"SELECT id FROM media_items WHERE folder_id IN ({ph}) AND status = 'missing'", chunk))
-    if not mids:
-        return {"removed": 0}
-    try:
-        from . import media as media_service
-        media_service.delete_thumbnails(mids)
-    except Exception:  # noqa: BLE001
-        pass
-    removed = 0
-    for chunk in chunk_ids(mids):
-        ph = ",".join("?" * len(chunk))
-        removed += delete(f"DELETE FROM media_items WHERE id IN ({ph})", chunk)
-    logger.info("清理丢失记录：目录 %s 下删除 %d 条", folder_id, removed)
-    return {"removed": removed}
+        rows.extend(query_all(
+            "SELECT id, folder_id, path, filename FROM media_items"
+            f" WHERE folder_id IN ({ph}) AND status = 'missing'", chunk))
+    removed_ids = []
+    live = unknown = 0
+    root_by_folder: dict[int, int | None] = {}
+    roots: dict[int, bool] = {}
+    directories: dict[str, tuple[set[str], dict] | None] = {}
+    for item in rows:
+        fid = item["folder_id"]
+        if fid not in root_by_folder:
+            root_by_folder[fid] = _root_of(fid)
+        rid = root_by_folder[fid]
+        if rid is None:
+            unknown += 1
+            continue  # No trustworthy imported root: retain the record.
+        if rid not in roots:
+            root = query_one("SELECT path FROM folders WHERE id = ?", (rid,))
+            roots[rid] = bool(root) and _isdir_fast(root["path"], ttl=0)
+        if not roots[rid]:
+            unknown += 1
+            continue
+        directory = os.path.dirname(item["path"])
+        if directory not in directories:
+            try:
+                with os.scandir(directory) as entries:
+                    names = {e.name for e in entries}
+            except FileNotFoundError:
+                directories[directory] = (set(), {})  # Reachable root, deleted child.
+            except OSError:
+                directories[directory] = None
+            else:
+                directories[directory] = (names, _folded_names(names))
+        snapshot = directories[directory]
+        if snapshot is None:
+            unknown += 1
+            continue
+        names, folded = snapshot
+        state, _ = _disk_name_match(item["path"], item["filename"], names, folded)
+        if state == "present":
+            live += 1
+            continue
+        if state == "unknown":
+            unknown += 1
+            continue
+        state = probe_file(item["path"])
+        if state != "absent":
+            if state == "present":
+                live += 1
+            else:
+                unknown += 1
+            continue
+        # A concurrent recovery/move must win over this stale purge selection.
+        if delete("DELETE FROM media_items WHERE id = ? AND path = ? AND status = 'missing'",
+                  (item["id"], item["path"])):
+            removed_ids.append(item["id"])
+        else:
+            unknown += 1
+    if removed_ids:
+        try:
+            from . import media as media_service
+            media_service.delete_thumbnails(removed_ids)
+        except Exception:  # noqa: BLE001
+            pass
+    logger.info("清理丢失记录：目录 %s 下删除 %d 条，保留 %d 条（存活 %d / 未知 %d）",
+                folder_id, len(removed_ids), live + unknown, live, unknown)
+    return {"removed": len(removed_ids), "retained": live + unknown,
+            "live": live, "unknown": unknown}
 
 
 def check_folder(folder_id: int) -> dict:
@@ -816,8 +978,16 @@ def recheck_missing(folder_id: int | None = None) -> dict:
         if names is None:
             unknown += len(items)
             continue
+        folded = _folded_names(names)
         for it in items:
-            if it["filename"] in names:
+            state, name = _disk_name_match(it["path"], it["filename"], names, folded)
+            if state == "unknown":
+                unknown += 1
+                continue
+            if state == "present":
+                if not _update_spelling(it, name):
+                    unknown += 1
+                    continue
                 execute(
                     "UPDATE media_items SET status = 'ok',"
                     " status_at = datetime('now','localtime'), status_reason = ? WHERE id = ?",

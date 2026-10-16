@@ -11,12 +11,14 @@
 const JobProgress = {
   _busy: false,      // 是否有后台任务正在进行（用于互斥）
   _timer: null,
+  _generation: 0,
 
   /** 是否有任务正在进行 */
   isBusy() { return this._busy; },
 
   /** 停止轮询（关闭弹窗时调用）。后台任务本身不受影响，仍会跑完。 */
   stopPolling() {
+    ++this._generation;
     if (this._timer) { clearTimeout(this._timer); this._timer = null; }
     this._busy = false;
   },
@@ -64,14 +66,17 @@ const JobProgress = {
    */
   async run(title, startFn, onDone, urlPrefix, onFail) {
     if (this._busy) { toast("已有任务在进行中，请稍候", "err"); return; }
+    const generation = ++this._generation;
     this._busy = true;
     this.show(title, "正在启动…");
     let jobId;
     try {
       const r = await startFn();
+      if (generation !== this._generation) return;
       jobId = r && r.job_id;
       if (!jobId) throw new Error("未返回任务 id");
     } catch (e) {
+      if (generation !== this._generation) return;
       this._busy = false;
       this._fail(title, "启动失败：" + (e.message || e));
       if (onFail) onFail(e);
@@ -79,15 +84,18 @@ const JobProgress = {
     }
     const t0 = Date.now();
     const tick = async () => {
+      if (generation !== this._generation) return;
       let job;
       try {
         job = await API.get((urlPrefix || "/api/tags/jobs/") + jobId);
       } catch (e) {
+        if (generation !== this._generation) return;
         this._busy = false;
         this._timer = null;
         this._fail(title, "读取进度失败：" + (e.message || e));
         return;
       }
+      if (generation !== this._generation) return;
       this.update(job);
       if (job.status === "running") {
         // 前 1.5 秒快速刷新，让用户马上看到"真的在跑"

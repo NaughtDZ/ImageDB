@@ -28,13 +28,24 @@ _LOCK = threading.Lock()
 MAX_JOBS = 50
 
 
-def new_job(kind: str, label: str) -> str:
-    """新建任务记录，返回 12 位 job_id。超过上限时丢弃最旧的。"""
+def _prune_finished() -> None:
+    """Called under _LOCK. Active tasks may exceed the soft retention limit."""
+    finished = sorted((k for k, j in JOBS.items() if j["status"] in ("done", "failed", "cancelled")),
+                      key=lambda k: JOBS[k]["_ts"])
+    for key in finished[:max(0, len(JOBS) - MAX_JOBS)]:
+        JOBS.pop(key, None)
+
+
+def new_job(kind: str, label: str, exclusive: bool = False) -> str:
+    """Atomically claim a job; exclusive rejects a running job of the same kind.
+
+    Raises ValueError if busy. Only finished jobs are eligible for eviction.
+    Exclusivity is process-local, not a multi-instance database lock.
+    """
     jid = uuid.uuid4().hex[:12]
     with _LOCK:
-        if len(JOBS) >= MAX_JOBS:
-            for k in sorted(JOBS, key=lambda x: JOBS[x]["_ts"])[: len(JOBS) - MAX_JOBS + 1]:
-                JOBS.pop(k, None)
+        if exclusive and any(j["kind"] == kind and j["status"] == "running" for j in JOBS.values()):
+            raise ValueError(f"已有 {kind} 任务正在运行")
         JOBS[jid] = {
             "id": jid, "kind": kind, "label": label, "status": "running",
             "total": 0, "done": 0, "progress": 0,
@@ -42,6 +53,7 @@ def new_job(kind: str, label: str) -> str:
             "_ts": time.time(),
             "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        _prune_finished()
     return jid
 
 
@@ -82,6 +94,7 @@ def finish(jid: str, status: str, result=None, error: str | None = None) -> None
                        progress=100 if status == "done" else job.get("progress", 0),
                        message="完成" if status == "done" else (error or "失败"),
                        finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+            _prune_finished()
 
 
 def run_async(jid: str, fn, name: str = "job") -> str:
@@ -92,7 +105,11 @@ def run_async(jid: str, fn, name: str = "job") -> str:
         except Exception as exc:  # noqa: BLE001
             logger.warning("后台任务失败 %s（%s）：%s", jid, name, exc)
             finish(jid, "failed", error=str(exc))
-    threading.Thread(target=worker, daemon=True, name=name + "-" + jid).start()
+    try:
+        threading.Thread(target=worker, daemon=True, name=name + "-" + jid).start()
+    except Exception as exc:
+        finish(jid, "failed", error=str(exc))
+        raise
     return jid
 
 

@@ -37,6 +37,10 @@ API 概览：
 from __future__ import annotations
 
 import ctypes
+import errno
+import math
+import uuid
+from functools import wraps
 import json
 import shutil
 import sys
@@ -57,7 +61,7 @@ from . import jobs, tagstats
 from . import version as app_version
 from .config import AppConfig
 from .database import (DATA_DIR, FRAMES_DIR, THUMBS_DIR, RECYCLE_DIR, execute, execute_rowcount,
-                      executemany, query_all, query_one, chunk_ids)
+                      executemany, query_all, query_one, chunk_ids, transaction)
 from .downloader import (download_model, install_directml,
                       list_jobs as list_dl_jobs, test_proxy, update_deps)
 from .tagging import manager as tagging_manager
@@ -96,24 +100,134 @@ def _os_recycle_supported(path: str) -> bool:
         return False  # 判定失败 → 保守走应用内回收站（不丢数据）
 
 
-def _app_trash_move(row: dict, tags: list[dict]) -> str:
-    """把文件移到本地"应用内回收站" data/recycle_bin/，并写入 recycle_bin 表（可还原）。
+# 串行化本进程内的移动/回收/恢复，防止同一文件被两个请求同时操作。
+# 文件系统与 SQLite 不是同一个事务；下面对普通失败做补偿，不声称掉电原子性。
+_FILE_OP_LOCK = threading.RLock()
 
-    返回暂存路径。标签以 JSON 快照保存，恢复时一并写回，避免丢失标签元数据。
-    """
+
+def _serialized_file_operation(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        with _FILE_OP_LOCK:
+            return fn(*args, **kwargs)
+    return wrapped
+
+
+def _move_file_no_replace(src: str, dest: str) -> None:
+    """移动文件，绝不覆盖目标；跨盘以独占创建复制成功后再删源。"""
+    if not os.path.isfile(src):
+        raise OSError("源文件不存在或不可读取")
+    if os.name == "nt":
+        try:
+            os.rename(src, dest)  # Windows rename 不覆盖已有目标
+            return
+        except OSError as exc:
+            if exc.errno != errno.EXDEV and getattr(exc, "winerror", None) != 17:
+                raise
+    # POSIX rename 会覆盖目标，因此也走独占创建；失败仅清理本次创建的副本。
+    created = False
+    try:
+        with open(src, "rb") as inp, open(dest, "xb") as out:
+            created = True
+            shutil.copyfileobj(inp, out, length=1024 * 1024)
+            out.flush()
+            os.fsync(out.fileno())
+        shutil.copystat(src, dest)
+        os.unlink(src)
+    except Exception:
+        if created:
+            try:
+                os.unlink(dest)
+            except OSError:
+                logger.warning("复制失败，残留副本需检查：%s", dest)
+        raise
+
+
+def _rollback_move(src: str, dest: str, original_error: Exception) -> None:
+    """把已移动的 dest 退回 src；回滚失败时明确报告保留下来的文件位置。"""
+    try:
+        _move_file_no_replace(dest, src)
+    except Exception as rollback_error:
+        raise RuntimeError(
+            f"写库失败：{original_error}；文件回退失败：{rollback_error}；请保留并检查 {dest}"
+        ) from original_error
+
+
+def _app_trash_move(row: dict, tags: list[dict]) -> str:
+    """先保存可恢复记录，再移动文件；失败时保留源记录，不覆盖旧回收文件。"""
     os.makedirs(RECYCLE_DIR, exist_ok=True)
-    dest = os.path.join(RECYCLE_DIR, f"{row['id']}_{os.path.basename(row['path'])}")
-    shutil.move(row["path"], dest)
+    # 不拼接完整原名，避免长文件名叠加 UUID 后超过文件系统单组件长度限制。
+    suffix = os.path.splitext(row["path"])[1][:16]
+    dest = os.path.join(RECYCLE_DIR, f"{row['id']}_{uuid.uuid4().hex}{suffix}")
     tags_json = json.dumps(
         [{"name": t["name"], "confidence": t.get("confidence", 1.0),
-          "source": t.get("source", "manual")} for t in tags],
-        ensure_ascii=False)
-    execute(
+          "source": t.get("source", "manual")} for t in tags], ensure_ascii=False)
+    rid = execute(
         "INSERT INTO recycle_bin(media_id, folder_id, path, filename, type, ext, size, mtime, "
         "thumbnail, stored_path, tags_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (row["id"], row["folder_id"], row["path"], row["filename"], row["type"],
          row["ext"], row["size"], row["mtime"], row["thumbnail"], dest, tags_json))
+    try:
+        _move_file_no_replace(row["path"], dest)
+    except Exception:
+        # 只有能确认未移动时才丢弃这条准备记录；未知状态留下线索。
+        if library.probe_file(row["path"]) == "present" and library.probe_file(dest) == "absent":
+            execute("DELETE FROM recycle_bin WHERE id = ?", (rid,))
+        raise
     return dest
+
+
+def _restore_recycle_row(row: dict) -> None:
+    """验证→移动→原子恢复记录/标签；数据库失败则退回暂存文件。"""
+    if not query_one("SELECT id FROM folders WHERE id = ?", (row["folder_id"],)):
+        raise ValueError("原目录已从库中移除，无法还原")
+    if library.probe_file(row["path"]) != "absent":
+        raise ValueError("原位置已存在文件或无法确认可用，未还原")
+    stored = row.get("stored_path")
+    if not stored or library.probe_file(stored) != "present":
+        raise ValueError("回收站暂存文件不存在或无法读取，已保留回收站记录")
+    # 先完整校验快照，坏标签不能导致文件已移动而恢复到一半。
+    tags = json.loads(row.get("tags_json") or "[]")
+    if not isinstance(tags, list):
+        raise ValueError("标签快照必须为数组")
+    clean = []
+    for tag in tags:
+        if not isinstance(tag, dict) or not isinstance(tag.get("name"), str) or not tag["name"].strip():
+            raise ValueError("标签快照格式错误")
+        confidence = float(tag.get("confidence", 1.0))
+        source = tag.get("source", "manual")
+        if not math.isfinite(confidence) or not 0 <= confidence <= 1 or not isinstance(source, str):
+            raise ValueError("标签快照置信度或来源错误")
+        clean.append((tag["name"].strip(), confidence, source))
+
+    def restore(conn):
+        existing = conn.execute("SELECT id, path FROM media_items WHERE id = ? OR path = ?",
+                                (row["media_id"], row["path"])).fetchall()
+        # 支持移入回收站后删除媒体记录失败的重试，但绝不覆盖其他媒体身份。
+        if any(r["id"] != row["media_id"] or r["path"] != row["path"] for r in existing):
+            raise ValueError("原媒体 ID 或路径已被其他记录占用")
+        if existing:
+            conn.execute("UPDATE media_items SET status='ok', status_at=datetime('now','localtime'), "
+                         "status_reason='recycle:restored' WHERE id=?", (row["media_id"],))
+        else:
+            conn.execute(
+                "INSERT INTO media_items(id, folder_id, path, filename, type, ext, size, "
+                "mtime, thumbnail, status) VALUES (?,?,?,?,?,?,?,?,?, 'ok')",
+                (row["media_id"], row["folder_id"], row["path"], row["filename"], row["type"],
+                 row["ext"], row["size"], row["mtime"], row["thumbnail"]))
+        for name, confidence, source in clean:
+            conn.execute("INSERT INTO tags(name,source) VALUES (?,?) ON CONFLICT(name) DO NOTHING", (name, source))
+            tag_id = conn.execute("SELECT id FROM tags WHERE name=?", (name,)).fetchone()[0]
+            conn.execute("INSERT OR IGNORE INTO media_tags(media_id,tag_id,confidence,source) VALUES (?,?,?,?)",
+                         (row["media_id"], tag_id, confidence, source))
+        conn.execute("DELETE FROM recycle_bin WHERE id=?", (row["id"],))
+
+    _move_file_no_replace(stored, row["path"])
+    try:
+        transaction(restore)
+    except Exception as exc:
+        _rollback_move(stored, row["path"], exc)
+        raise
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB_DIR = os.path.join(BASE_DIR, "web")
@@ -488,7 +602,6 @@ def create_app(config: AppConfig) -> FastAPI:
         return library.build_tree()
 
     @app.post("/api/library/import")
-    @app.post("/api/library/import")
     def api_import(req: ImportRequest) -> dict:
         """导入目录（后台任务）：先多线程统计文件数，再逐目录导入，带进度条。"""
         path = os.path.abspath(req.path)
@@ -528,7 +641,10 @@ def create_app(config: AppConfig) -> FastAPI:
             raise HTTPException(409, "已有扫描在进行中：" + str(running.get("label") or ""))
         if query_one("SELECT id FROM folders WHERE id = ?", (req.folder_id,)) is None:
             raise HTTPException(404, "目录不存在")
-        return {"job_id": library.start_rescan(req.folder_id)}
+        try:
+            return {"job_id": library.start_rescan(req.folder_id)}
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/library/jobs/{jid}")
     def api_library_job(jid: str) -> dict:
@@ -541,7 +657,10 @@ def create_app(config: AppConfig) -> FastAPI:
     @app.post("/api/library/remove")
     def api_remove(req: FolderIdRequest) -> dict:
         """把目录从库中移除（不影响磁盘文件）。"""
-        return {"removed_media": library.remove_folder(req.folder_id)}
+        removed = library.remove_folder(req.folder_id)
+        if removed:
+            tagstats.mark_dirty()
+        return {"removed_media": removed}
 
     @app.post("/api/library/check")
     def api_check(req: FolderIdRequest) -> dict:
@@ -615,6 +734,7 @@ def create_app(config: AppConfig) -> FastAPI:
                 "basic": m["basic"], "exif": m["exif"], "iptc": m["iptc"], "xmp": m["xmp"]}
 
     @app.post("/api/media/delete")
+    @_serialized_file_operation
     def api_media_delete(req: MediaDeleteRequest) -> dict:
         """批量从数据库删除媒体记录（不删除磁盘文件）。
         同时清理缩略图文件与无引用的标签。"""
@@ -641,98 +761,111 @@ def create_app(config: AppConfig) -> FastAPI:
         return {"removed": removed}
 
     @app.post("/api/media/trash")
+    @_serialized_file_operation
     def api_media_trash(req: MediaTrashRequest) -> dict:
-        """把选中的媒体文件移到回收站。
-
-        - 文件所在盘支持系统回收站（本地固定盘）→ send2trash 进系统回收站（文件管理器可还原）；
-        - 文件所在盘不支持系统回收站（网络盘/可移动盘等）→ 移到本地 data/recycle_bin/ 作"应用内回收站"，
-          本应用可还原，绝不彻底删除磁盘文件，确保任何情况都不丢数据。
-        """
+        """显式移入回收站；无法确认源文件时保留记录并返回逐项错误。"""
         if not req.media_ids:
             raise HTTPException(400, "未指定媒体")
-        rows: list[dict] = []
-        for chunk in chunk_ids(req.media_ids):
-            ph = ",".join("?" * len(chunk))
-            rows.extend(query_all(
-                "SELECT id, folder_id, path, filename, type, ext, size, mtime, thumbnail "
-                f"FROM media_items WHERE id IN ({ph})", chunk))
-        os_trash = 0
-        app_trash = 0
-        for r in rows:
+        os_trash = app_trash = records_only = 0
+        errors = []
+        for mid in dict.fromkeys(req.media_ids):
+            r = query_one("SELECT * FROM media_items WHERE id=?", (mid,))
+            if not r:
+                continue
             try:
-                if not os.path.exists(r["path"]):
-                    # 文件已被外部删除：仅清理数据库记录
-                    execute("DELETE FROM media_items WHERE id = ?", (r["id"],))
+                state = library.probe_file(r["path"])
+                if state == "unknown":
+                    raise OSError("源文件无法读取，已保留记录与标签")
+                if state == "absent":
+                    rid = library._root_of(r["folder_id"])
+                    root = query_one("SELECT path FROM folders WHERE id=?", (rid,)) if rid is not None else None
+                    if not root or not library._isdir_fast(root["path"], ttl=0):
+                        raise OSError("媒体根目录离线或无法确认，已保留记录与标签")
+                    # 用户明确删除且确认文件不在：只删除记录，不冒充移入回收站。
+                    execute("DELETE FROM media_items WHERE id=?", (mid,))
+                    media_service.delete_thumbnails([mid])
+                    records_only += 1
                     continue
                 if _os_recycle_supported(r["path"]):
-                    send2trash(r["path"])                       # 进系统回收站
-                    media_service.delete_thumbnails([r["id"]])  # 清理缩略图缓存
+                    send2trash(r["path"])
+                    execute("DELETE FROM media_items WHERE id=?", (mid,))
+                    media_service.delete_thumbnails([mid])
                     os_trash += 1
                 else:
-                    # 该盘不支持系统回收站（如网络盘 K:）：移到应用内回收站，可还原
                     tags = query_all(
-                        "SELECT mt.tag_id, mt.confidence, mt.source, t.name "
-                        "FROM media_tags mt JOIN tags t ON t.id = mt.tag_id WHERE mt.media_id = ?",
-                        (r["id"],))
+                        "SELECT mt.confidence, mt.source, t.name FROM media_tags mt "
+                        "JOIN tags t ON t.id=mt.tag_id WHERE mt.media_id=?", (mid,))
                     _app_trash_move(r, tags)
+                    execute("DELETE FROM media_items WHERE id=?", (mid,))
                     app_trash += 1
-                execute("DELETE FROM media_items WHERE id = ?", (r["id"],))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("移文件到回收站失败 id=%s：%s", r["id"], exc)
-                continue  # 失败时保留记录，避免数据库与磁盘不一致
-        execute("DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM media_tags)")
-        if os_trash and app_trash:
-            msg = f"{os_trash} 个已移到系统回收站，{app_trash} 个已移入应用回收站（可还原）"
-        elif os_trash:
-            msg = f"{os_trash} 个已移到系统回收站"
-        else:
-            msg = f"{app_trash} 个已移入应用回收站（可用回收站功能还原）"
-        return {"removed": os_trash + app_trash, "os_trash": os_trash,
-                "app_trash": app_trash, "message": msg}
-
+            except Exception as exc:
+                logger.warning("移文件到回收站失败 id=%s：%s", mid, exc)
+                errors.append(f"{r['filename']}：{exc}")
+        removed = os_trash + app_trash + records_only
+        if removed:
+            tagstats.mark_dirty()
+        msg = f"系统回收站 {os_trash} 个 · 应用回收站 {app_trash} 个 · 已丢失记录清理 {records_only} 个"
+        if errors:
+            msg += f" · 失败 {len(errors)} 个（保留记录，详情见错误列表）"
+        return {"removed": removed, "os_trash": os_trash, "app_trash": app_trash,
+                "records_only": records_only, "message": msg, "errors": errors}
 
     @app.post("/api/media/move")
+    @_serialized_file_operation
     def api_media_move(req: MediaMoveRequest) -> dict:
-        """把选中的媒体文件移动到指定目录，并更新数据库记录（folder_id + path）。"""
+        """移动失败绝不删除记录；同步名字与路径，写库失败则回退文件。"""
         if not req.media_ids:
             raise HTTPException(400, "未指定媒体")
         dest_dir = os.path.abspath(req.dest_dir)
         if not os.path.isdir(dest_dir):
-            raise HTTPException(400, f"目标目录不存在：{dest_dir}")
-        folder = query_one("SELECT id FROM folders WHERE path = ?", (dest_dir,))
+            raise HTTPException(400, f"目标目录不存在或无法读取：{dest_dir}")
+        folder = query_one("SELECT id FROM folders WHERE path=?", (dest_dir,))
         if not folder:
             raise HTTPException(400, f"目标目录未入库：{dest_dir}（请先导入该目录）")
-        rows: list[dict] = []
-        for chunk in chunk_ids(req.media_ids):
-            ph = ",".join("?" * len(chunk))
-            rows.extend(query_all(f"SELECT id, path, filename FROM media_items WHERE id IN ({ph})", chunk))
-        moved = 0
-        for r in rows:
-            if not os.path.exists(r["path"]):
-                execute("DELETE FROM media_items WHERE id = ?", (r["id"],))
-                continue
-            src = r["path"]
-            dest = os.path.join(dest_dir, os.path.basename(src))
-            if os.path.abspath(dest) == os.path.abspath(src):
+        moved = skipped = 0
+        errors = []
+        for mid in dict.fromkeys(req.media_ids):
+            r = query_one("SELECT id,path,filename FROM media_items WHERE id=?", (mid,))
+            if not r:
+                skipped += 1
                 continue
             try:
-                if os.path.exists(dest):
-                    stem, ext = os.path.splitext(os.path.basename(src))
-                    i = 1
-                    while os.path.exists(dest):
-                        dest = os.path.join(dest_dir, f"{stem}_{i}{ext}")
-                        i += 1
-                os.rename(src, dest)
-            except OSError:
-                try:
-                    shutil.move(src, dest)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("移动文件失败 id=%s：%s", r["id"], exc)
+                src = r["path"]
+                if library.probe_file(src) != "present":
+                    raise OSError("源文件不存在或无法读取，已保留记录与标签")
+                if os.path.samefile(os.path.dirname(src), dest_dir):
+                    skipped += 1
                     continue
-            execute("UPDATE media_items SET path = ?, folder_id = ? WHERE id = ?",
-                    (dest, folder["id"], r["id"]))
-            moved += 1
-        return {"moved": moved}
+                stem, ext = os.path.splitext(os.path.basename(src))
+                suffix = 0
+                while True:
+                    name = f"{stem}_{suffix}{ext}" if suffix else os.path.basename(src)
+                    dest = os.path.join(dest_dir, name)
+                    state = library.probe_file(dest)
+                    if state == "unknown":
+                        raise OSError("无法确认目标路径是否可用")
+                    occupied = query_one("SELECT id FROM media_items WHERE path=?", (dest,))
+                    if state == "absent" and not occupied:
+                        break
+                    suffix += 1
+                _move_file_no_replace(src, dest)
+                try:
+                    def update(conn):
+                        n = conn.execute(
+                            "UPDATE media_items SET path=?, folder_id=?, filename=?, status='ok', "
+                            "status_at=datetime('now','localtime'), status_reason='move:present' "
+                            "WHERE id=? AND path=?", (dest, folder["id"], name, mid, src)).rowcount
+                        if n != 1:
+                            raise ValueError("媒体记录已变化，移动已取消")
+                    transaction(update)
+                except Exception as exc:
+                    _rollback_move(src, dest, exc)
+                    raise
+                moved += 1
+            except Exception as exc:
+                logger.warning("移动文件失败 id=%s：%s", mid, exc)
+                errors.append(f"{r['filename']}：{exc}")
+        return {"moved": moved, "skipped": skipped, "errors": errors}
 
     # ================= 应用内回收站 =================
     @app.get("/api/recycle/list")
@@ -743,58 +876,30 @@ def create_app(config: AppConfig) -> FastAPI:
 
 
     @app.post("/api/recycle/restore")
+    @_serialized_file_operation
     def api_recycle_restore(req: RecycleIdsRequest) -> dict:
-        """把应用内回收站的素材还原到原目录，并恢复数据库记录（含原标签、缩略图）。"""
+        """原子恢复数据库内容；暂存文件缺失时保留恢复线索。"""
         if not req.ids:
             raise HTTPException(400, "未指定回收站条目")
-        rows: list[dict] = []
-        for chunk in chunk_ids(req.ids):
-            ph = ",".join("?" * len(chunk))
-            rows.extend(query_all(f"SELECT * FROM recycle_bin WHERE id IN ({ph})", chunk))
         restored = 0
-        errors: list[str] = []
-        for r in rows:
+        errors = []
+        for rid in dict.fromkeys(req.ids):
+            row = query_one("SELECT * FROM recycle_bin WHERE id=?", (rid,))
+            if not row:
+                continue
             try:
-                folder = query_one("SELECT id FROM folders WHERE id = ?", (r["folder_id"],))
-                if not folder:
-                    errors.append(f"{r['filename']}：原目录已从库中移除，无法还原")
-                    continue
-                if os.path.exists(r["path"]):
-                    errors.append(f"{r['filename']}：原位置已存在同名文件，未还原")
-                    continue
-                if os.path.exists(r["stored_path"]):
-                    shutil.move(r["stored_path"], r["path"])
-                execute(
-                    "INSERT INTO media_items(id, folder_id, path, filename, type, ext, size, "
-                    "mtime, thumbnail, status) VALUES (?,?,?,?,?,?,?,?,?, 'ok')",
-                    (r["media_id"], r["folder_id"], r["path"], r["filename"], r["type"],
-                     r["ext"], r["size"], r["mtime"], r["thumbnail"]))
-                if r.get("tags_json"):
-                    for tg in json.loads(r["tags_json"]):
-                        name = (tg.get("name") or "").strip()
-                        if not name:
-                            continue
-                        tag_row = query_one("SELECT id FROM tags WHERE name = ?", (name,))
-                        if tag_row:
-                            tag_id = tag_row["id"]
-                        else:
-                            tag_id = execute(
-                                "INSERT INTO tags(name, source) VALUES (?, ?)",
-                                (name, tg.get("source", "manual")))
-                        execute(
-                            "INSERT OR IGNORE INTO media_tags(media_id, tag_id, confidence, source) "
-                            "VALUES (?,?,?,?)",
-                            (r["media_id"], tag_id, tg.get("confidence", 1.0),
-                             tg.get("source", "manual")))
-                execute("DELETE FROM recycle_bin WHERE id = ?", (r["id"],))
+                _restore_recycle_row(row)
                 restored += 1
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("还原失败 id=%s：%s", r["id"], exc)
-                errors.append(f"{r['filename']}：{exc}")
+            except Exception as exc:
+                logger.warning("还原失败 id=%s：%s", rid, exc)
+                errors.append(f"{row['filename']}：{exc}")
+        if restored:
+            tagstats.mark_dirty()
         return {"restored": restored, "errors": errors}
 
 
     @app.post("/api/recycle/delete")
+    @_serialized_file_operation
     def api_recycle_delete(req: RecycleIdsRequest) -> dict:
         """从应用内回收站中永久删除素材（前端需二次确认）。"""
         if not req.ids:

@@ -23,6 +23,7 @@ import threading
 from .. import media as media_service
 from .. import tagstats
 from ..database import execute, query_all, query_one
+from ..imagetag import _write_tags as write_image_tags
 from .base import TaggerPlugin
 
 logger = logging.getLogger("imagedb.tagging.manager")
@@ -139,7 +140,11 @@ class PluginManager:
             daemon=True,
             name=f"tag-job-{job_id}",
         )
-        thread.start()
+        try:
+            thread.start()
+        except Exception as exc:
+            self._finish_job(job_id, "failed", str(exc))
+            raise
         logger.info("打标任务已启动：job=%s tool=%s scope=%s ids=%s",
                     job_id, tool, scope_type, scope_ids[:20])
         return job_id
@@ -147,7 +152,22 @@ class PluginManager:
     # ---- 任务执行 ----
     def _run_job(self, job_id: int, tool: str, scope_type: str,
                  scope_ids: list[int], overwrite: bool) -> None:
-        """后台执行打标任务（工作线程）。"""
+        """Finalization boundary for setup, model loading, SQL and worker errors."""
+        try:
+            self._run_job_inner(job_id, tool, scope_type, scope_ids, overwrite)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("打标任务失败 job=%s", job_id)
+            try:
+                self._finish_job(job_id, "failed", str(exc))
+            except Exception:  # Database unavailable: report rather than hide finalization failure.
+                logger.exception("无法结束打标任务 job=%s", job_id)
+
+    def _run_job_inner(self, job_id: int, tool: str, scope_type: str,
+                       scope_ids: list[int], overwrite: bool) -> None:
+        state = self.get_job(job_id)
+        if state and state["status"] == "cancelled":
+            self._finish_job(job_id, "cancelled", "用户取消")
+            return
         plugin = self.get(tool)
         if plugin is None:
             self._finish_job(job_id, "failed", "工具已被移除")
@@ -191,7 +211,8 @@ class PluginManager:
             return
         
         total = len(target_ids)
-        execute("UPDATE tag_jobs SET status='running', total=? WHERE id=?", (total, job_id))
+        execute("UPDATE tag_jobs SET status='running', total=? WHERE id=? AND status != 'cancelled'",
+                (total, job_id))
 
         # 懒加载模型
         if not plugin.is_loaded and not plugin.load():
@@ -247,6 +268,9 @@ class PluginManager:
             logger.warning("批量处理失败：%s", exc)
             results_list = [[] for _ in rows]
         for row, tags in zip(rows, results_list):
+            state = self.get_job(job_id)
+            if state and state["status"] == "cancelled":
+                return done
             if tags:
                 self._write_tags(row["id"], tags, tool, overwrite)
             done += 1
@@ -336,34 +360,11 @@ class PluginManager:
 
     def _write_tags(self, media_id: int, results: list,
                     source: str, overwrite: bool) -> None:
-        """把标签写入数据库（去重；overwrite 时替换同来源旧标签）。"""
-        if overwrite:
-            # 删除该来源的旧标签，避免堆积
-            execute("""DELETE FROM media_tags WHERE media_id = ?
-                       AND source = ? AND source != 'manual'""", (media_id, source))
-        existing = set()
-        if not overwrite:
-            for r in query_all("SELECT tag_id FROM media_tags WHERE media_id = ?", (media_id,)):
-                existing.add(r["tag_id"])
-
-        for r in results:
-            tag = (r.tag or "").strip()
-            if not tag:
-                continue
-            # 插入标签（若已存在则获取 id）
-            tag_row = query_one("SELECT id FROM tags WHERE name = ?", (tag,))
-            if tag_row:
-                tag_id = tag_row["id"]
-            else:
-                tag_id = execute("INSERT INTO tags(name, source) VALUES (?, ?)", (tag, source))
-            if tag_id in existing:
-                continue
-            execute(
-                """INSERT OR REPLACE INTO media_tags(media_id, tag_id, confidence, source)
-                   VALUES (?, ?, ?, ?)""",
-                (media_id, tag_id, round(max(0.0, min(1.0, r.confidence)), 4), source),
-            )
-            existing.add(tag_id)
+        """Validate and atomically replace only this tool's associations."""
+        if not isinstance(results, list):
+            raise ValueError("tagging results must be a list")
+        tags = [{"name": r.tag, "confidence": round(r.confidence, 4)} for r in results]
+        write_image_tags(media_id, tags, source, overwrite)
 
     def _media_in_folders(self, folder_id: int) -> list[int]:
         """收集目录子树下的所有媒体 id。"""
@@ -384,13 +385,14 @@ class PluginManager:
 
     def _finish_job(self, job_id: int, status: str, message: str | None = None) -> None:
         execute(
-            """UPDATE tag_jobs SET status = ?, message = ?,
+            """UPDATE tag_jobs SET
+               message = CASE WHEN status = 'cancelled' THEN '用户取消' ELSE ? END,
+               status = CASE WHEN status = 'cancelled' THEN status ELSE ? END,
                finished_at = datetime('now','localtime') WHERE id = ?""",
-            (status, message or "", job_id),
+            (message or "", status, job_id),
         )
-        if status == "done":
-            # 打标会新增大量 media_tags → 标签使用次数缓存立即重算（后台，不阻塞）
-            tagstats.mark_dirty()
+        # Failed/cancelled jobs may have committed earlier images too.
+        tagstats.mark_dirty()
 
     def get_job(self, job_id: int) -> dict | None:
         return query_one("SELECT * FROM tag_jobs WHERE id = ?", (job_id,))

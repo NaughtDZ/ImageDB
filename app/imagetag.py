@@ -14,15 +14,17 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
 import time
 import uuid
+from urllib.parse import quote
 
 from . import jobs
 from .database import (chunk_ids, execute, execute_rowcount, executemany,
-                       query_all, query_one)
+                       query_all, query_one, transaction)
 
 logger = logging.getLogger("imagedb.imagetag")
 
@@ -75,25 +77,49 @@ def write_tags(directory: str, tags_by_filename: dict, rebuild: bool = False) ->
     return {"written": len(entries), "error": None}
 
 
-def read_tags(directory: str) -> dict:
-    """读取 directory/.imgtag，返回 {filename: [ {name,source,confidence} ]}；无/异常返回 {}。"""
-    if not os.path.isfile(sidecar_path(directory)):
+def _readonly_sidecar_uri(path: str) -> str:
+    """Encode drive/UNC paths without a SQLite URI authority component."""
+    absolute = os.path.abspath(path).replace(chr(92), "/")
+    if not absolute.startswith("/"):
+        absolute = "/" + absolute
+    return "file://" + quote(absolute, safe="/:") + "?mode=ro"
+
+
+def read_tags(directory: str, errors: list[dict] | None = None) -> dict:
+    """Return the filename-to-tags mapping; skip invalid rows, never turn them into [].
+
+    Existing callers retain the dict contract. Optional errors collects structured
+    {dir, filename?, error} diagnostics. A valid empty list is kept intentionally.
+    """
+    path = sidecar_path(directory)
+    if not os.path.isfile(path):
         return {}
     out: dict = {}
+
+    def report(exc, filename=None):
+        error = {"dir": directory, "error": str(exc)}
+        if filename is not None:
+            error["filename"] = filename
+        if errors is not None:
+            errors.append(error)
+        logger.warning("读取 .imgtag 失败 %s：%s", path, error)
+
     try:
-        conn = sqlite3.connect(sidecar_path(directory), timeout=30)
-        conn.row_factory = sqlite3.Row
+        # Read-only URI also prevents accidentally creating a missing sidecar.
+        conn = sqlite3.connect(_readonly_sidecar_uri(path), uri=True, timeout=30)
         try:
-            for r in conn.execute("SELECT filename, tags_json FROM tags"):
+            for filename, payload in conn.execute("SELECT filename, tags_json FROM tags"):
                 try:
-                    tags = json.loads(r["tags_json"])
-                except Exception:
-                    tags = []
-                out[r["filename"]] = tags if isinstance(tags, list) else []
+                    tags = json.loads(payload)
+                    _normalize_tags(tags)  # Validate the entire image before accepting it.
+                except (TypeError, ValueError, OverflowError) as exc:
+                    report(exc, filename)
+                    continue
+                out[filename] = tags
         finally:
             conn.close()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("读取 .imgtag 失败 %s：%s", directory, exc)
+        report(exc)
     return out
 
 
@@ -116,35 +142,59 @@ def _fetch_tags(media_ids: list[int]) -> dict:
     return out
 
 
+def _normalize_tags(tags: list) -> list[tuple[str, float]]:
+    """Validate a complete image's labels before any destructive SQL is issued."""
+    if not isinstance(tags, list):
+        raise ValueError("tags must be a list")
+    normalized = []
+    for index, item in enumerate(tags):
+        if isinstance(item, dict):
+            name = item.get("name")
+            confidence = item.get("confidence")
+        elif isinstance(item, str):
+            name, confidence = item, None
+        else:
+            raise ValueError(f"tag[{index}] must be a string or object")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"tag[{index}] must have a nonempty string name")
+        try:
+            confidence = 1.0 if confidence is None else float(confidence)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"tag[{index}] has invalid confidence") from exc
+        if not math.isfinite(confidence):
+            raise ValueError(f"tag[{index}] confidence must be finite")
+        normalized.append((name.strip(), max(0.0, min(1.0, confidence))))
+    return normalized
+
+
 def _write_tags(media_id: int, tags: list, source: str, overwrite: bool = False) -> int:
-    """把一组标签写入主库 media_tags/tags（source 区分；overwrite 替换同来源）。返回新增数。"""
-    if overwrite:
-        execute("DELETE FROM media_tags WHERE media_id = ? AND source = ?", (media_id, source))
-    existing: set = set()
-    if not overwrite:
-        for r in query_all("SELECT tag_id FROM media_tags WHERE media_id = ?", (media_id,)):
-            existing.add(r["tag_id"])
-    added = 0
-    for t in (tags or []):
-        name = (t.get("name") if isinstance(t, dict) else t) or ""
-        name = str(name).strip()
-        if not name:
-            continue
-        row = query_one("SELECT id FROM tags WHERE name = ?", (name,))
-        tag_id = row["id"] if row else execute("INSERT INTO tags(name, source) VALUES (?, ?)", (name, source))
-        if tag_id in existing:
-            continue
-        conf = 1.0
-        if isinstance(t, dict):
-            try:
-                conf = float(t.get("confidence", 1.0) or 1.0)
-            except (TypeError, ValueError):
-                conf = 1.0
-        execute("INSERT OR IGNORE INTO media_tags(media_id, tag_id, confidence, source) VALUES (?, ?, ?, ?)",
-                (media_id, tag_id, max(0.0, min(1.0, conf)), source))
-        existing.add(tag_id)
-        added += 1
-    return added
+    """Atomically replace only this source; existing other-source links always win.
+
+    Raises ValueError on invalid input before deletion. Returns inserted links,
+    not attempted inserts (duplicates and protected associations do not count).
+    """
+    normalized = _normalize_tags(tags)
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("source must be a nonempty string")
+
+    def write(conn):
+        if overwrite:
+            conn.execute("DELETE FROM media_tags WHERE media_id = ? AND source = ? "
+                         "AND source != 'manual'", (media_id, source))
+        added = 0
+        for name, confidence in normalized:
+            conn.execute("INSERT INTO tags(name, source) VALUES (?, ?) "
+                         "ON CONFLICT(name) DO NOTHING", (name, source))
+            tag_id = conn.execute("SELECT id FROM tags WHERE name = ?", (name,)).fetchone()[0]
+            cur = conn.execute(
+                "INSERT INTO media_tags(media_id, tag_id, confidence, source) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(media_id, tag_id) DO NOTHING",
+                (media_id, tag_id, confidence, source),
+            )
+            added += cur.rowcount
+        return added
+
+    return transaction(write)
 
 
 def _subtree_folders(folder_id: int) -> list[dict]:
@@ -236,11 +286,13 @@ def import_folder(folder_id: int, overwrite: bool = False, progress_cb=None) -> 
     """导入目录子树：读各目录 .imgtag，按文件名匹配回主库媒体并写回标签（source=import）。
 
     overwrite=True 时替换该来源旧标签，否则去重追加（不覆盖）。
-    返回 {media: 匹配媒体数, tags: 新增标签数, files: 处理了哪些 .imgtag 数}。
+    返回 {media: 成功导入媒体数, tags: 插入关联数, files: 已存在的 .imgtag 数,
+          errors: [{dir, filename?, error}]}。坏条目整张跳过，合法空列表仍可覆盖清空。
     """
     media_hit = 0
     tags_added = 0
     files = 0
+    errors: list[dict] = []
     folders = _subtree_folders(folder_id)
     total = len(folders) or 1
     for i, f in enumerate(folders, 1):
@@ -249,18 +301,21 @@ def import_folder(folder_id: int, overwrite: bool = False, progress_cb=None) -> 
         r = _import_one_dir(f["path"], f["id"], overwrite)
         media_hit += r["media"]
         tags_added += r["tags"]
+        errors.extend(r["errors"])
         if r["file"]:
             files += 1
     if progress_cb:
         progress_cb(total, total, "导入完成")
-    return {"media": media_hit, "tags": tags_added, "files": files}
+    return {"media": media_hit, "tags": tags_added, "files": files, "errors": errors}
 
 
 def _import_one_dir(dir_path: str, folder_db_id: int, overwrite: bool) -> dict:
-    """导入单个目录的 .imgtag。返回 {media, tags, file}（file=该目录是否读到 .imgtag）。"""
-    side = read_tags(dir_path)
+    """Import valid rows; return {media, tags, file, errors}, including row failures."""
+    errors: list[dict] = []
+    side = read_tags(dir_path, errors=errors)
+    present = os.path.isfile(sidecar_path(dir_path))
     if not side:
-        return {"media": 0, "tags": 0, "file": False}
+        return {"media": 0, "tags": 0, "file": present, "errors": errors}
     rows = query_all("SELECT id, filename FROM media_items WHERE folder_id = ?", (folder_db_id,))
     byname = {r["filename"]: r["id"] for r in rows}
     media_hit = 0
@@ -269,9 +324,17 @@ def _import_one_dir(dir_path: str, folder_db_id: int, overwrite: bool) -> dict:
         mid = byname.get(fname)
         if mid is None:
             continue
+        try:
+            added = _write_tags(mid, tags, "import", overwrite)
+        except Exception as exc:  # Each failed image rolls back independently.
+            errors.append({"dir": dir_path, "filename": fname, "error": str(exc)})
+            continue
         media_hit += 1
-        tags_added += _write_tags(mid, tags, "import", overwrite)
-    return {"media": media_hit, "tags": tags_added, "file": True}
+        tags_added += added
+    if media_hit:
+        from . import tagstats
+        tagstats.mark_dirty()
+    return {"media": media_hit, "tags": tags_added, "file": True, "errors": errors}
 
 # ---------------- 迁移自检 ----------------
 def _check_dir_sidecar(path: str, media_filenames: list[str]) -> dict:
