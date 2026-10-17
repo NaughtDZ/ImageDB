@@ -44,6 +44,7 @@ from functools import wraps
 import json
 import shutil
 import sys
+import tempfile
 import logging
 import os
 import threading
@@ -51,13 +52,13 @@ import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import library, media as media_service, metadata as media_metadata, imagetag as imagetag_service
-from . import jobs, tagstats
+from . import jobs, similar, tagstats
 from . import version as app_version
 from .config import AppConfig
 from .database import (DATA_DIR, FRAMES_DIR, THUMBS_DIR, RECYCLE_DIR, execute, execute_rowcount,
@@ -308,6 +309,20 @@ class MediaMoveRequest(BaseModel):
     """把媒体文件移动到指定目录。"""
     media_ids: list[int]
     dest_dir: str
+
+
+class SimilarFromMediaRequest(BaseModel):
+    """以库内某张图去找相似/相同/同标签的其它图。"""
+    media_id: int
+    mode: str = "auto"          # auto / exact / similar / tag
+    threshold: float = -1.0     # 负值表示用默认阈值
+    top: int = 100
+
+
+class SimilarIndexRequest(BaseModel):
+    """建立以图找图索引（folder_id=0 表示全库）。"""
+    folder_id: int = 0
+    workers: int = 4        # 并发读取线程数：网络盘上 4 线程约为单线程的 3~4 倍吞吐
 
 
 class MediaAddRequest(BaseModel):
@@ -574,6 +589,102 @@ def _require_media(mid: int, mark_missing: bool = False) -> dict:
 
 
 # ---------------- 应用工厂 ----------------
+MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+
+
+def _tag_ids_by_names(names: list[str]) -> list[int]:
+    """标签名 → 标签 id（只取已存在于库里的，忽略未出现过的名字）。"""
+    out: list[int] = []
+    clean = list(dict.fromkeys(n for n in names if n))[:32]
+    for chunk in chunk_ids(clean):
+        ph = ",".join("?" * len(chunk))
+        for r in query_all(f"SELECT id FROM tags WHERE name IN ({ph})", chunk):
+            out.append(r["id"])
+    return out
+
+
+def _tag_query_image(data: bytes) -> tuple[list[str], str | None]:
+    """用已配置的打标工具给**上传的查询图**打标签。
+
+    只写一个临时文件，用完立刻删除；不打标、不写库、不改变任何媒体记录。
+    优先本地 ONNX 工具，最后才试需要联网的 LLM。
+    """
+    mgr = tagging_manager.get_manager()
+    if mgr is None:
+        return [], "打标插件尚未初始化"
+    tmp_dir = os.path.join(DATA_DIR, "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(suffix=".jpg", dir=tmp_dir)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        last_err = None
+        for name in ("wd14", "cl_tagger", "llm"):
+            plugin = mgr.get(name)
+            if plugin is None:
+                continue
+            try:
+                if not plugin.is_loaded and not plugin.load():
+                    last_err = f"{name} 加载失败"
+                    continue
+                results = plugin.tag_image(tmp) or []
+                if results:
+                    return [r.name for r in results], None
+                last_err = f"{name} 没有返回标签"
+            except Exception as exc:  # noqa: BLE001
+                last_err = f"{name}：{exc}"
+        return [], last_err or "没有可用的打标工具"
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _similar_items(mode: str, threshold: float, top: int, hashes: dict | None = None,
+                   tag_ids: list[int] | None = None, exclude: int | None = None) -> list[dict]:
+    """按模式合并三路结果：完全相同 → 感知近似 → 标签相似（按此优先级去重）。"""
+    items: list[dict] = []
+    seen: set[int] = set()
+
+    def take(rows):
+        for it in rows:
+            if it["media_id"] in seen:
+                continue
+            seen.add(it["media_id"])
+            items.append(it)
+
+    if hashes and mode in ("exact", "auto"):
+        take(similar.find_exact(hashes, top=top))
+    if hashes and mode in ("similar", "auto"):
+        max_d = similar.DEFAULT_MAX_DISTANCE if threshold < 0 else int(round(threshold))
+        take(similar.search_hashes(hashes, max_distance=max_d, top=top))
+    if tag_ids and mode in ("tag", "auto"):
+        min_s = 0.3 if threshold < 0 else threshold
+        take(similar.search_by_tags(tag_ids, min_score=min_s, top=top, exclude=exclude))
+    return items[:top]
+
+
+def _similar_payload(items: list[dict], mode: str, threshold: float,
+                     note: str = "", extra: dict | None = None) -> dict:
+    rows = similar.resolve_media([i["media_id"] for i in items])
+    out = []
+    for it in items:
+        r = rows.get(it["media_id"])
+        if not r:
+            continue            # 索引里有、媒体已被删除：直接跳过
+        d = _media_to_dict(r)
+        d.update(kind=it["kind"], score=it["score"], distance=it.get("distance"),
+                 shared_tags=it.get("shared_tags"))
+        out.append(d)
+    stats = similar.index_stats()
+    payload = {"mode": mode, "threshold": threshold, "items": out, "count": len(out),
+               "indexed": stats["indexed"], "index_total": stats["total"], "note": note}
+    if extra:
+        payload.update(extra)
+    return payload
+
+
 def create_app(config: AppConfig) -> FastAPI:
     stop_event = threading.Event()
 
@@ -586,13 +697,15 @@ def create_app(config: AppConfig) -> FastAPI:
         tagging_manager.init_manager(lambda: config)
         # 预热标签计数缓存（后台线程，不阻塞启动）：让第一次打开标签面板就是毫秒级
         tagstats.warm()
+        # 预热以图找图的哈希镜像（索引为空时几乎零成本）
+        similar.warm()
         # 不再启动任何后台/定时的全库校验线程。
         # 原则：程序只做「恢复」，绝不定时批量标记丢失；「丢失」只能由用户在
         # 侧边栏显式重扫某个目录后确认（POST /api/library/rescan）。
         yield
         stop_event.set()
 
-    app = FastAPI(title="ImageDB", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="ImageDB", version="1.1.0", lifespan=lifespan)
     app.state.config = config
 
     # ================= 目录库 =================
@@ -1438,6 +1551,110 @@ def create_app(config: AppConfig) -> FastAPI:
         自动卸载冲突的普通 onnxruntime 并安装 DirectML 版。"""
         jid = install_directml(config.proxy_dict())
         return {"job_id": jid}
+
+    # ================= 以图找图 =================
+    @app.post("/api/similar/search")
+    async def api_similar_search(request: Request) -> dict:
+        """上传一张图，找库里相同/近似的图（原始字节 POST，零额外依赖）。
+
+        查询模式 mode：auto（完全相同+近似+标签）/ exact（只找完全相同）
+        / similar（只要感知近似，threshold 为最大汉明距离）
+        / tag（只要标签相似，threshold 为最小 Jaccard）。
+        上传的图片只在内存里解码，不落盘、不入库。
+        """
+        params = request.query_params
+        mode = (params.get("mode") or "auto").lower()
+        if mode not in ("auto", "exact", "similar", "tag"):
+            raise HTTPException(400, "mode 只能是 auto / exact / similar / tag")
+        try:
+            threshold = float(params.get("threshold", "-1"))
+        except (TypeError, ValueError):
+            threshold = -1.0
+        try:
+            top = max(1, min(similar.MAX_QUERY_TOP, int(params.get("top", "100"))))
+        except (TypeError, ValueError):
+            top = 100
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, "图片太大（上限 64 MB）")
+        data = await request.body()
+        if not data:
+            raise HTTPException(400, "没有收到图片数据")
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, "图片太大（上限 64 MB）")
+        info = similar.hash_bytes(data)
+        if not info:
+            raise HTTPException(400, "无法解码这张图片（支持 jpg/png/webp/gif/bmp 等常见格式）")
+        if info.get("too_large"):
+            raise HTTPException(400, f"这张图太大（{info.get('pixels', 0):,} 像素），"
+                                     "比库里任何一张都大，无法用于检索")
+        tag_ids = None
+        note = ""
+        if mode in ("tag", "auto"):
+            names, err = _tag_query_image(data)
+            if names:
+                tag_ids = _tag_ids_by_names(names)
+                note = f"上传图识别出 {len(names)} 个标签"
+            elif mode == "tag":
+                raise HTTPException(400, f"标签相似需要可用的打标工具：{err or '未配置'}")
+            else:
+                note = "未启用标签相似（" + (err or "没有可用的打标工具") + "）"
+        items = _similar_items(mode, threshold, top, info, tag_ids)
+        return _similar_payload(items, mode, threshold, note)
+
+    @app.post("/api/similar/from-media")
+    def api_similar_from_media(req: SimilarFromMediaRequest) -> dict:
+        """以库里已有的某张图去找相似图（不需要上传）。"""
+        if query_one("SELECT id FROM media_items WHERE id = ?", (req.media_id,)) is None:
+            raise HTTPException(404, "媒体不存在")
+        mode = (req.mode or "auto").lower()
+        if mode not in ("auto", "exact", "similar", "tag"):
+            raise HTTPException(400, "mode 只能是 auto / exact / similar / tag")
+        top = max(1, min(similar.MAX_QUERY_TOP, int(req.top)))
+        hashes = None
+        if mode in ("auto", "exact", "similar"):
+            hashes = similar.hash_for_media(req.media_id)
+            if hashes is None:
+                raise HTTPException(400, "这张图读不到，无法计算指纹（可能已丢失或无法解码）")
+        tag_ids = (similar.tag_ids_for_media(req.media_id)
+                   if mode in ("tag", "auto") else None)
+        note = ""
+        if mode in ("tag", "auto") and not tag_ids:
+            note = "这张图还没有标签，标签相似没有结果（可先给它打标）"
+        items = _similar_items(mode, req.threshold, top, hashes, tag_ids,
+                               exclude=req.media_id)
+        return _similar_payload(items, mode, req.threshold, note)
+
+    @app.post("/api/similar/index/start")
+    def api_similar_index_start(req: SimilarIndexRequest) -> dict:
+        """建立/补齐哈希索引（后台任务，可暂停）。只读文件，不改任何媒体记录。"""
+        try:
+            jid = jobs.new_job("similar-index", "建立以图找图索引", exclusive=True)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+        def run():
+            similar.mark_running(True)
+            try:
+                return similar.build_index(req.folder_id or None,
+                                           jobs.progress_cb(jid),
+                                           workers=req.workers)
+            finally:
+                similar.mark_running(False)
+
+        jobs.run_async(jid, run, name="similar")
+        return {"job_id": jid}
+
+    @app.post("/api/similar/index/cancel")
+    def api_similar_index_cancel() -> dict:
+        """请求停止索引（当前这张图处理完就停，已写入的进度保留）。"""
+        similar.cancel_index()
+        return {"ok": True}
+
+    @app.get("/api/similar/status")
+    def api_similar_status() -> dict:
+        """索引进度概览。"""
+        return similar.index_stats()
 
     # ================= 静态资源 =================
     os.makedirs(THUMBS_DIR, exist_ok=True)

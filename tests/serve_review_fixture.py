@@ -38,9 +38,22 @@ def main():
             for i in range(count):
                 name = f"{group}-{i:03}.jpg"
                 path = folder / name
-                Image.new("RGB", (640, 400), (30 + i % 160, 80, 130)).save(path)
-                db.execute("INSERT INTO media_items(folder_id,path,filename,type,ext,size) VALUES (?,?,?,'image','jpg',?)",
-                           (fid, str(path), name, path.stat().st_size))
+                # 每张都造出可区分的图案：纯色图的感知哈希几乎一样，测不出搜索效果
+                im = Image.new("RGB", (640, 400), (20 + i % 200, 60 + (i * 7) % 180, 120))
+                px = im.load()
+                for y in range(0, 400, 4):
+                    for x in range(0, 640, 4):
+                        px[x, y] = ((x + i * 13) % 256, (y * 2 + i) % 256, (x * y + i) % 256)
+                im.save(path)
+                db.execute("INSERT INTO media_items(folder_id,path,filename,type,ext,size,mtime) VALUES (?,?,?,'image','jpg',?,?)",
+                           (fid, str(path), name, path.stat().st_size, path.stat().st_mtime))
+                if group == "alpha" and i == 0:
+                    query = Path(__file__).resolve().parents[1] / "_isotest" / "browser_query.jpg"
+                    query.parent.mkdir(parents=True, exist_ok=True)
+                    query.write_bytes(path.read_bytes())
+        from app import similar
+        stats = similar.build_index()
+        print(f"FIXTURE_INDEX added={stats['added']} failed={stats['failed']}", flush=True)
         print(f"ISOLATED_FIXTURE root={base} port={args.port}", flush=True)
         uvicorn.run(create_app(AppConfig()), host="127.0.0.1", port=args.port, log_level="warning")
 

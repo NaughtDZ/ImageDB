@@ -164,6 +164,28 @@ html, body {
 #sel-info { font-weight: 600; color: var(--accent); }
 #result-info { color: var(--text-dim); }
 .toolbar-actions { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+/* ---------- 工具栏分组 / 下拉菜单 ---------- */
+#toolbar { flex-direction: column; align-items: stretch; gap: 8px; }
+.toolbar-row { display: flex; align-items: center; gap: 12px; min-width: 0; flex-wrap: wrap; }
+.toolbar-actions { margin-left: auto; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: flex-end; min-width: 0; }
+.tb-sep { width: 1px; height: 20px; background: var(--border); flex-shrink: 0; }
+.selection-bar { border-top: 1px dashed var(--border); padding-top: 8px; }
+.selection-bar #sel-info { font-weight: 600; color: var(--accent); }
+.dropdown { position: relative; }
+.icon-btn { padding: 6px 9px; min-width: 34px; }
+.menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 60;
+  min-width: 210px; padding: 4px; background: var(--bg-panel);
+  border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .45);
+}
+.menu-item {
+  display: block; width: 100%; text-align: left; background: transparent;
+  border: 0; color: var(--text); padding: 7px 10px; border-radius: 6px;
+  cursor: pointer; font-size: 13px; white-space: nowrap;
+}
+.menu-item:hover { background: var(--bg-hover); }
+.menu-sep { height: 1px; background: var(--border); margin: 4px 6px; }
 #toolbar select {
   background: var(--bg); border: 1px solid var(--border); color: var(--text);
   padding: 5px; border-radius: var(--radius); outline: none;
@@ -450,6 +472,46 @@ body.selecting { user-select: none; cursor: crosshair; }
 .imagetag-log .path { color: var(--text-dim); word-break: break-all; }
 .imagetag-log .err { color: var(--danger); }
 .imagetag-log .ok { color: var(--ok); }
+
+/* ---------- 以图搜图 ---------- */
+.similar-dialog { width: min(1080px, 94vw); max-height: 90vh; }
+.similar-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+.similar-toolbar select { min-width: 190px; }
+.similar-threshold { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-dim); }
+.similar-threshold input[type="range"] { width: 220px; }
+.similar-drop {
+  border: 2px dashed var(--border); border-radius: 8px; min-height: 120px;
+  display: flex; align-items: center; justify-content: center; text-align: center;
+  padding: 12px; gap: 12px; transition: border-color .15s, background .15s;
+}
+.similar-drop.over { border-color: var(--accent); background: rgba(90, 140, 255, .08); }
+.similar-drop #similar-preview { max-height: 150px; max-width: 200px; border-radius: 6px; object-fit: contain; }
+.similar-drop .hint { margin-top: 6px; }
+.similar-results {
+  margin-top: 10px; display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  max-height: 52vh; overflow-y: auto; padding: 2px;
+}
+.similar-card {
+  position: relative; border: 1px solid var(--border); border-radius: 6px;
+  overflow: hidden; cursor: pointer; background: var(--panel, #1c1f26);
+}
+.similar-card:hover { border-color: var(--accent); }
+.similar-card img { width: 100%; height: 130px; object-fit: cover; display: block; }
+.similar-badge {
+  position: absolute; top: 4px; left: 4px; font-size: 11px; padding: 1px 6px;
+  border-radius: 10px; background: rgba(0, 0, 0, .65); color: #fff;
+}
+.similar-badge.exact { background: rgba(60, 170, 90, .9); }
+.similar-badge.near { background: rgba(70, 120, 220, .9); }
+.similar-badge.tag { background: rgba(170, 120, 40, .9); }
+.similar-name {
+  display: block; font-size: 11px; padding: 3px 6px; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.similar-empty { padding: 24px; text-align: center; color: var(--text-dim); font-size: 13px; }
+.similar-empty.err { color: var(--danger); }
+
 .imagetag-log ul { margin: 2px 0 0 16px; }
 /* ---------- 丢失媒体 / 丢失目录（外部丢失占位） ---------- */
 .media-card.missing { border-style: dashed; opacity: .8; }

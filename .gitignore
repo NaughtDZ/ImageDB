@@ -27,3 +27,6 @@ _prov_test.jpg
 
 # 诊断/测试临时文件
 *_diag.html
+
+# 本地临时脚本/探针（不进仓库）
+_isotest/

@@ -522,8 +522,10 @@ const Gallery = {
 
   /** 更新选择信息 */
   updateSelInfo() {
-    document.getElementById("sel-info").textContent =
-      "已选择 " + App.state.selected.size + " 项";
+    const n = App.state.selected.size;
+    document.getElementById("sel-info").textContent = "已选择 " + n + " 项";
+    // 没选中时整条操作栏都不显示：避免一排"删除/移动"亮着误导点击
+    document.getElementById("selection-bar").classList.toggle("hidden", n === 0);
   },
 
   /** 清除选择 */

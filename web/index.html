@@ -32,10 +32,16 @@
   </div>
 
   <div class="actions">
-    <button id="btn-import" class="btn primary">＋ 导入目录</button>
-    <button id="btn-rescan" class="btn" title="重新扫描当前目录">⟳ 重新扫描</button>
-    <button id="btn-recheck-missing" class="btn" title="把被标记为丢失、但实际还在磁盘上的文件恢复回正常（只恢复，不标记、不删除）">♻ 恢复校验</button>
-    <button id="btn-settings" class="btn" title="代理 / 打标 / 视频 / 模型下载">⚙ 设置</button>
+    <button id="btn-import" class="btn primary" title="导入一个目录（递归扫描并入库）">＋ 导入</button>
+    <button id="btn-similar" class="btn" title="上传或粘贴一张图片，找库里完全相同 / 视觉近似 / 标签相似的图">🔍 以图搜图</button>
+    <button id="btn-settings" class="btn icon-btn" title="设置：代理 / 打标 / 视频 / 模型下载">⚙</button>
+    <div class="dropdown">
+      <button class="btn icon-btn" data-menu="menu-top-more" title="更多：重新扫描 / 恢复校验">⋯</button>
+      <div class="menu hidden" id="menu-top-more">
+        <button class="menu-item" id="btn-rescan" title="重新扫描当前选中目录">⟲ 重新扫描当前目录</button>
+        <button class="menu-item" id="btn-recheck-missing" title="把被标记为丢失、但实际还在磁盘上的文件恢复回正常（只恢复，不标记、不删除）">✓ 恢复校验（只恢复）</button>
+      </div>
+    </div>
   </div>
 </header>
 
@@ -61,37 +67,56 @@
   <!-- 右侧：画廊 -->
   <section id="content">
     <div id="toolbar">
-      <span id="sel-info">未选择</span>
-      <span id="result-info"></span>
-      <div class="toolbar-actions">
-        <span class="thumb-slider" title="调整缩略图大小">
-          <span class="icon">🔍</span>
-          <input type="range" id="thumb-size-slider" min="100" max="400" value="160">
-          <span class="icon" style="font-size:16px">🔎</span>
-        </span>
-        <span class="page-size" title="每页显示数量（翻页时丢弃旧页缩略图以节省内存）">
-          <label>每页</label>
-          <input type="number" id="page-size-input" min="10" max="200" step="10" value="60" style="width:56px">
-          <span>张</span>
-        </span>
-        <select id="sort-select">
-          <option value="name">按名称</option>
-          <option value="date">按入库时间</option>
-          <option value="size">按大小</option>
-          <option value="mtime">按修改时间</option>
-        </select>
-        <button id="btn-only-missing" class="btn" title="只看被标记为丢失的媒体">⚠ 只看丢失<span id="missing-count" class="cnt"></span></button>
-        <button id="btn-tag" class="btn" title="对选中项或当前目录打标">🏷 打标</button>
-        <button id="btn-view" class="btn" title="查看选中项">👁 查看</button>
-        <button id="btn-manual-tags" class="btn" title="手动添加/移除标签">✎ 标签</button>
-        <button id="btn-export-tags" class="btn" title="把标签导出到各目录的 .imgtag（迁移用）">🏷 导出标签</button>
-        <button id="btn-import-tags" class="btn" title="从 .imgtag 把标签导入回主库">▼ 导入标签</button>
-        <button id="btn-selfcheck-tags" class="btn" title="迁移前自检：核对 .imgtag 与磁盘/主库">🔍 迁移自检</button>
-        <button id="btn-delete-sel" class="btn" title="从数据库中删除选中项（不删除磁盘文件）">🗑 删除选中</button>
-        <button id="btn-trash-sel" class="btn" title="把选中文件移到回收站（需输入 yes 确认）">♻ 移到回收站</button>
-        <button id="btn-move-sel" class="btn" title="把选中文件移动到其他目录（需输入 yes 确认）">📁 移动</button>
-        <button id="btn-recycle" class="btn" title="查看/还原应用内回收站的素材（来自不支持系统回收站的盘）">♻ 回收站</button>
-        <button id="btn-clear-sel" class="btn">清除选择</button>
+      <!-- 常驻行：视图 / 筛选 / 低频入口 -->
+      <div class="toolbar-row">
+        <span id="result-info"></span>
+        <div class="toolbar-actions">
+          <span class="thumb-slider" title="调整缩略图大小">
+            <span class="icon">◻</span>
+            <input type="range" id="thumb-size-slider" min="100" max="400" value="160">
+            <span class="icon" style="font-size:16px">◼</span>
+          </span>
+          <span class="page-size" title="每页显示数量（翻页时丢弃旧页缩略图以节省内存）">
+            <label>每页</label>
+            <input type="number" id="page-size-input" min="10" max="200" step="10" value="60" style="width:56px">
+            <span>张</span>
+          </span>
+          <select id="sort-select" title="排序方式">
+            <option value="name">按名称</option>
+            <option value="date">按入库时间</option>
+            <option value="size">按大小</option>
+            <option value="mtime">按修改时间</option>
+          </select>
+          <span class="tb-sep"></span>
+          <button id="btn-only-missing" class="btn" title="只看被标记为丢失的媒体">⚠ 只看丢失<span id="missing-count" class="cnt"></span></button>
+          <span class="tb-sep"></span>
+          <div class="dropdown">
+            <button class="btn icon-btn" data-menu="menu-toolbar-more" title="更多：标签迁移 / 回收站">⋯</button>
+            <div class="menu hidden" id="menu-toolbar-more">
+              <button class="menu-item" id="btn-export-tags" title="把标签导出到各目录的 .imgtag（迁移用）">🏷 导出标签到 .imgtag</button>
+              <button class="menu-item" id="btn-import-tags" title="从 .imgtag 把标签导入回主库">▼ 从 .imgtag 导入标签</button>
+              <button class="menu-item" id="btn-selfcheck-tags" title="迁移前自检：核对 .imgtag 与磁盘/主库">🔍 迁移自检</button>
+              <div class="menu-sep"></div>
+              <button class="menu-item" id="btn-recycle" title="查看/还原应用内回收站的素材（来自不支持系统回收站的盘）">📦 打开回收站</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 选中行：只有选中素材时才出现，避免没选中时一排灰按钮误导 -->
+      <div id="selection-bar" class="toolbar-row selection-bar hidden">
+        <span id="sel-info">未选择</span>
+        <div class="toolbar-actions">
+          <button id="btn-tag" class="btn" title="对选中项打标">🏷 打标</button>
+          <button id="btn-manual-tags" class="btn" title="手动添加/移除标签">✎ 标签</button>
+          <button id="btn-view" class="btn" title="查看选中项">👁 查看</button>
+          <span class="tb-sep"></span>
+          <button id="btn-move-sel" class="btn" title="把选中文件移动到其他目录（需输入 yes 确认）">📁 移动</button>
+          <button id="btn-trash-sel" class="btn" title="把选中文件移到回收站（需输入 yes 确认）">🗑 回收站</button>
+          <button id="btn-delete-sel" class="btn danger" title="只从数据库删除选中记录，不删除磁盘文件">✕ 删除记录</button>
+          <span class="tb-sep"></span>
+          <button id="btn-clear-sel" class="btn" title="取消全部选择">取消选择</button>
+        </div>
       </div>
     </div>
     <div id="gallery" class="gallery"></div>
@@ -447,6 +472,46 @@
   </div>
 </div>
 
+<!-- ========== 以图搜图 ========== -->
+<div id="similar-modal" class="modal hidden">
+  <div class="dialog similar-dialog">
+    <div class="dialog-head">🔍 以图搜图 <button class="btn close" data-close="similar-modal">✕</button></div>
+    <div class="dialog-body">
+      <div class="similar-toolbar">
+        <select id="similar-mode" title="不同的「相似」含义不同，门槛也不同">
+          <option value="auto">完全相同 + 近似 + 标签</option>
+          <option value="exact">只找完全相同的文件</option>
+          <option value="similar">找视觉近似</option>
+          <option value="tag">找标签相似</option>
+        </select>
+        <span id="similar-threshold-wrap" class="similar-threshold">
+          <input type="range" id="similar-threshold" min="0" max="16" step="1" value="6">
+          <span id="similar-threshold-label">相近度门槛：6 位</span>
+        </span>
+      </div>
+
+      <div id="similar-drop" class="similar-drop">
+        <img id="similar-preview" class="hidden" alt="查询图预览">
+        <div id="similar-drop-hint">
+          <div>把图片拖到这里，或按 <b>Ctrl+V</b> 粘贴，或</div>
+          <button id="similar-choose" class="btn primary">选择文件</button>
+          <input type="file" id="similar-file" accept="image/*" class="hidden">
+          <div class="hint">图片只在内存里比对，不会保存到库里，也不会上传网络。</div>
+        </div>
+      </div>
+
+      <div id="similar-note" class="hint" style="margin-top:8px"></div>
+      <div id="similar-results" class="similar-results"></div>
+    </div>
+    <div class="dialog-foot">
+      <span id="similar-index-state" class="hint" style="margin-right:auto"></span>
+      <button id="similar-build" class="btn">建立索引</button>
+      <button id="similar-stop" class="btn hidden">停止</button>
+      <button class="btn" data-close="similar-modal">关闭</button>
+    </div>
+  </div>
+</div>
+
 <div id="toast" class="hidden"></div>
 
 <script src="js/api.js"></script>
@@ -463,5 +528,6 @@
 <script src="js/folder_tags.js"></script>
 <script src="js/recycle.js"></script>
 <script src="js/settings.js"></script>
+<script src="js/similar.js"></script>
 </body>
 </html>

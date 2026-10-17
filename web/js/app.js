@@ -42,6 +42,9 @@ const App = {
     // 初始化目录标签管理
     FolderTags.init();
     Recycle.init();
+    // 以图搜图（上传/粘贴图片找相同或相似）
+    // 用 typeof 保护：即使 similar.js 没加载成功，其余界面也必须能正常初始化
+    if (typeof SimilarSearch !== "undefined") SimilarSearch.init();
   },
 
   /** 绑定顶栏与全局事件 */
@@ -85,11 +88,32 @@ const App = {
 
     document.getElementById("sort-select").onchange = () => Gallery.load(true);
 
-    // 点击空白处关闭右键菜单
+    // ---- ⋯ 下拉菜单（把低频操作收起来，工具栏才不会塞满）----
+    document.querySelectorAll("[data-menu]").forEach(btn => {
+      btn.onclick = (e) => {
+        e.stopPropagation();                       // 别让"点空白关闭"立刻把它关掉
+        const menu = document.getElementById(btn.dataset.menu);
+        if (!menu) return;
+        const willOpen = menu.classList.contains("hidden");
+        this.closeMenus();
+        menu.classList.toggle("hidden", !willOpen);
+      };
+    });
+    document.querySelectorAll(".menu-item").forEach(item => {
+      item.addEventListener("click", () => this.closeMenus());
+    });
+
+    // 点击空白处关闭下拉菜单与右键菜单
     document.addEventListener("click", () => {
+      this.closeMenus();
       const m = document.getElementById("context-menu");
       if (m) m.remove();
     });
+  },
+
+  /** 关闭所有下拉菜单 */
+  closeMenus() {
+    document.querySelectorAll(".menu").forEach(m => m.classList.add("hidden"));
   },
 
   /** 从搜索框收集筛选条件并重新加载 */

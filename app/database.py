@@ -118,6 +118,22 @@ CREATE TABLE IF NOT EXISTS tag_counts (
     updated_at  TEXT
 );
 
+-- 以图找图索引（**可重建的缓存**）：每张图一行感知哈希 + 内容指纹。
+-- 只服务于「找相同 / 找近似」；删掉整张表只是让下次搜索变慢，不影响任何媒体记录。
+-- 外键级联：删除媒体记录时自动清掉对应哈希行，不会留下孤儿数据。
+CREATE TABLE IF NOT EXISTS media_hashes (
+    media_id    INTEGER PRIMARY KEY,
+    phash       BLOB,                       -- 64 位感知哈希（8 字节大端）
+    dhash       BLOB,                       -- 64 位水平梯度哈希
+    ahash       BLOB,                       -- 64 位均值哈希
+    chash       BLOB,                       -- 16 字节 blake2b 内容指纹（"完全相同"判定）
+    src_size    INTEGER,                    -- 建索引时的文件大小（增量判断）
+    src_mtime   REAL,                       -- 建索引时的修改时间（增量判断）
+    updated_at  TEXT,
+    FOREIGN KEY (media_id) REFERENCES media_items(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_media_hashes_size ON media_hashes(src_size);
+
 -- 打标任务表：记录每个打标任务的进度
 CREATE TABLE IF NOT EXISTS tag_jobs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
