@@ -737,8 +737,14 @@ def rescan_folder(folder_id: int, progress_cb=None) -> dict:
         return {"added": 0, "missing": missing, "recovered": 0, "dirs_unknown": 0,
                 "dir_missing": True, "root_offline": False}
 
+    def report(pct: int, msg: str) -> None:
+        if progress_cb:
+            progress_cb(pct, msg)
+
+    report(1, "正在读取目录列表…")
     dirs = _subtree_folder_ids(folder_id)
     total = max(len(dirs), 1)
+    report(2, "共 %d 个目录，正在预载…" % len(dirs))
 
     # 预载「磁盘路径 → 目录 id」：遍历阶段命中就直接复用，省掉每个目录一次查库
     # （网络盘实测单查 0.58ms/个，1 万目录约 6 秒；批量预载 1 万条约 41 毫秒）
@@ -751,6 +757,7 @@ def rescan_folder(folder_id: int, progress_cb=None) -> dict:
     # 预载「已入库媒体路径」：重扫时磁盘上绝大多数文件都已入库，命中就跳过，
     # 否则每个文件都要做一次 INSERT OR IGNORE、每个目录还要一次独立事务
     #（实测 1 万目录/9 万文件时这是最大的一笔开销，能多花好几分钟）。
+    report(3, "正在统计子树媒体数…")     # 大子树这一步本身就要几百毫秒，必须让界面动起来
     n_media = 0
     for chunk in chunk_ids(dirs):
         ph = ",".join("?" * len(chunk))
@@ -761,14 +768,11 @@ def rescan_folder(folder_id: int, progress_cb=None) -> dict:
         known_files = None     # 太大就不预载（避免内存尖峰），退回旧行为
         logger.info("子树媒体数 %d 超过预载上限，跳过路径预载", n_media)
     else:
+        report(4, "正在预载已入库路径（%d 条）…" % n_media)
         for chunk in chunk_ids(dirs):
             ph = ",".join("?" * len(chunk))
             for r in query_all(f"SELECT path FROM media_items WHERE folder_id IN ({ph})", chunk):
                 known_files.add(r["path"])
-
-    def report(pct: int, msg: str) -> None:
-        if progress_cb:
-            progress_cb(pct, msg)
 
     missing = 0
     recovered = 0
@@ -790,31 +794,59 @@ def rescan_folder(folder_id: int, progress_cb=None) -> dict:
     # 否则进度条会长久停在 0%，用户以为卡死（旧版就是这个毛病）。
     def walk_progress(n: int, _path: str) -> None:
         if n % 20 == 1:                # 每 20 个目录更新一次，避免频繁抢锁
-            report(min(95, int(96 * n / total)),
-                   "正在扫描磁盘…（已处理 %d 个目录）" % n)
+            report(min(95, 5 + int(90 * n / total)),
+                   "正在扫描磁盘…（已处理 %d / %d 个目录）" % (n, total))
 
-    report(0, "正在扫描磁盘…")
+    report(5, "正在扫描磁盘…")
     seen: set[str] = {os.path.realpath(folder["path"])}
     _fa, added = _walk_and_insert(folder["path"], folder_id, seen,
                                  progress_cb=walk_progress, known=known,
                                  known_files=known_files, dir_cb=on_dir)
 
     # ---- 阶段 2（96~99%）：只处理磁盘上「没走到」的目录（已消失 / 读不到）----
-    # 正常情况下这里几乎是空转（所有目录都在阶段 1 处理过了）。
-    for f in dirs:
-        if f in visited:
-            continue
-        frow = query_one("SELECT path FROM folders WHERE id = ?", (f,))
-        if not frow:
-            continue
-        m, o, st = _sync_dir_status(f, frow["path"])
-        if st == "absent":
-            missing += _mark_all_missing([f], "rescan:dir_missing")
-        elif st == "unknown":
-            unknown += 1
-        else:
-            missing += m
-            recovered += o
+    # 正常情况下这里几近空转；但用户**整棵目录手动删掉**时这里会有上万个待办，
+    # 所以：① 分批取路径（不再逐条查库）② 按父目录分组、一个父目录只 scandir 一次
+    # ③ 每处理完一组就上报进度 —— 旧版这一段完全没有进度，界面看起来像死了。
+    pending_ids = [f for f in dirs if f not in visited]
+    if pending_ids:
+        by_parent: dict[str, list[tuple[int, str]]] = {}
+        for chunk in chunk_ids(pending_ids):
+            ph = ",".join("?" * len(chunk))
+            for row in query_all(f"SELECT id, path FROM folders WHERE id IN ({ph})", chunk):
+                by_parent.setdefault(os.path.dirname(row["path"]), []).append(
+                    (row["id"], row["path"]))
+        unreadable = object()          # 父目录读不到：判断不了，按「未知」处理、不标记
+        done_dirs = 0
+        total_pending = max(1, len(pending_ids))
+        for parent, items in by_parent.items():
+            try:
+                with os.scandir(parent) as it:
+                    names: set[str] | object | None = {entry.name for entry in it}
+            except FileNotFoundError:
+                names = None           # 父目录都不在了 → 子目录必然不存在
+            except OSError:
+                names = unreadable
+            absent_batch: list[int] = []
+            for fid, path in items:
+                if names is unreadable:
+                    unknown += 1
+                elif names is not None and os.path.basename(path.rstrip("\\/")) in names:
+                    # 目录还在：照旧逐目录精确比对（读不到仍然判 unknown，语义不变）
+                    m, o, st = _sync_dir_status(fid, path)
+                    if st == "absent":
+                        absent_batch.append(fid)
+                    elif st == "unknown":
+                        unknown += 1
+                    else:
+                        missing += m
+                        recovered += o
+                else:
+                    absent_batch.append(fid)
+                done_dirs += 1
+            if absent_batch:
+                missing += _mark_all_missing(absent_batch, "rescan:dir_missing")
+            report(min(99, 96 + int(3 * done_dirs / total_pending)),
+                   "正在核对未扫到的目录…（%d / %d）" % (done_dirs, total_pending))
     report(99, "扫描完成")
 
     return {"added": added, "missing": missing, "recovered": recovered,

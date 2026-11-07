@@ -705,7 +705,7 @@ def create_app(config: AppConfig) -> FastAPI:
         yield
         stop_event.set()
 
-    app = FastAPI(title="ImageDB", version="1.1.0", lifespan=lifespan)
+    app = FastAPI(title="ImageDB", version="1.1.1", lifespan=lifespan)
     app.state.config = config
 
     # ================= 目录库 =================
